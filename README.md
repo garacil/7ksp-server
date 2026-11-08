@@ -1,4 +1,4 @@
-# 7ksp
+# 7ks
 
 Chat, voice calls, video conferencing and file sharing with anyone in the world, using nothing but their email address.
 
