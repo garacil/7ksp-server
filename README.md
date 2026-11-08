@@ -4,7 +4,7 @@ Chat, voice calls, video conferencing and file sharing with anyone in the world,
 
 No phone number. No servers storing your messages or your files. From any device you choose.
 
-**7ks** is the application. **7KSP** is the open and free protocol it runs on, and it belongs to everyone. The specification is in [PROTOCOL.md](PROTOCOL.md).
+**7ks** is the application. **7KSP** is the open and free protocol it runs on, and it belongs to everyone. The specification is available in [English](PROTOCOL.en.md) and [Spanish](PROTOCOL.es.md).
 
 ## Intentions
 
@@ -75,4 +75,4 @@ Draft specification. There is no implementation yet. The planned order is:
 
 All code in this project, including the reference node (`7ksd`), the client library and the 7ks clients, is free software licensed under the [GNU General Public License, version 3 or (at your option) any later version](https://www.gnu.org/licenses/gpl-3.0.html) (GPL-3.0-or-later).
 
-The protocol specification (PROTOCOL.md) is published under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), a free license compatible with the GPLv3. Anyone may implement it without permission.
+The protocol specification ([PROTOCOL.en.md](PROTOCOL.en.md), [PROTOCOL.es.md](PROTOCOL.es.md)) is published under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), a free license compatible with the GPLv3. Anyone may implement it without permission.
