@@ -1,6 +1,6 @@
 # 7KSP/1 — 7ks Protocol
 
-Protocol version: 1. Document status: draft 0.5.
+Protocol version: 1. Document status: draft 0.6 (draft, unreleased).
 
 7KSP is an open and free protocol that, starting from an email address, opens a direct, encrypted, authenticated channel between two devices. This document contains everything needed to implement an interoperable client or node without consulting any other source. It is written so that a complete implementation fits in a few thousand lines in any language, using only standard components: HTTPS and WebSocket towards nodes, JSON, Ed25519, X25519, the Noise framework, STUN, UDP and, where a browser is involved, WebRTC.
 
@@ -362,8 +362,11 @@ A node MUST omit expired entries when serving it. A client MUST discard entries 
 The only thing a node stores persistently about traffic. It lives in the target's node.
 
 ```json
-{ "watcher_uid": "<uid>", "watcher_home": "https://nodeA.example", "target_uid": "<uid>", "exp": 1763164800 }
+{ "watcher_uid": "<uid>", "watcher_domain": "example.com", "watcher_home": "https://nodeA.example", "target_uid": "<uid>", "exp": 1763164800 }
 ```
+
+- `watcher_domain` is the domain of the watcher's address; the target's node uses it to check that the node registering the watch is a home of the watcher (§9.4).
+- `watcher_home` is the URL at which the watcher's node wants to receive `online`: one of the `homes` of the watcher's entry.
 
 ---
 
@@ -449,6 +452,8 @@ resolve(email):
        If all answered 404 → DOES NOT EXIST. If none answered → "unavailable".
 ```
 
+**Resolution by a node.** When a node resolves on behalf of a device (`auth` of a device whose directory it does not serve, `resolve`, `connect`, `watch`), it receives `uid` and `domain` from the device: the domain cannot be recovered from the `uid`, and without it step 2 is impossible. The node runs the same algorithm with the pair (`uid`, `domain`) in place of the address, validates the entries exactly as a client would, and MAY cache the validated record until the smallest `exp` of its entries and at most 1 hour. A node MUST NOT query or forward to any URL the algorithm did not produce: the `url` of the domain's DNS entry, the nodes the table (or the naming convention of Annex A) assigns to the prefix, and the `homes` of validated entries, each checked as in §9.4.
+
 ### 7.1 Key pinning (TOFU)
 
 ```
@@ -466,8 +471,8 @@ pin(uid, entries, dom_pk):
 ### 7.2 Cache and refresh
 
 - A client SHOULD cache a record until the smallest `exp` among its entries and at most 24 hours.
-- A client SHOULD subscribe (§9.3 `subscribe`) to the `uid`s it talks to frequently, to receive `record_changed` and resolve again without waiting for expiry.
-- A client MAY delegate steps 2 and 3 to its home with `resolve` (§9.3). The home runs the same algorithm. The client MUST still validate the result: the home is a transport, not an authority.
+- A client SHOULD subscribe (§9.3 `subscribe`) to the `uid`s it talks to frequently, to receive `record_changed` and resolve again without waiting for expiry. A node emits `record_changed` for the `uid`s whose directory it serves; for the others it is not guaranteed, so a client SHOULD resolve a contact homed elsewhere again when its cached record is older than 1 hour at the start of a session with that contact, and after any `unknown` or validation failure.
+- A client MAY delegate steps 2 and 3 to its home with `resolve` (§9.3), passing `uid` and `domain`. The home runs the same algorithm. The client MUST still validate the result: the home is a transport, not an authority.
 
 ---
 
@@ -568,7 +573,7 @@ These routes MUST NOT require authentication or limit by origin beyond what is r
 | `GET /verify/<req_id>` | — | `200 {proof}` · `202` · `410 expired` |
 | `GET /verify/<token>/confirm` | — | HTML confirmation page; marks the token as used |
 
-A node is responsible for a `uid` if: it is the domain node of that domain, or it is a shard node of the prefix and the domain has no DNS entry. In any other case it answers `403` with `{ "error": "not_responsible", "responsible": ["<url>", "…"] }` if it knows. `PUT` and `DELETE` need no session: the object carries its own authority.
+A node is responsible for a `uid` if: it is the domain node of that domain, or it is a shard node of the prefix and the domain has no DNS entry. In any other case it answers `403` with `{ "error": "not_responsible", "responsible": ["<url>", "…"] }` if it knows. `PUT` and `DELETE` need no session: the object carries its own authority. A node MUST reject (`invalid`) an entry whose `homes` contain a URL that is not `https` or whose host does not pass the address rule of §9.4, and SHOULD also require a valid node record at each of them (§9.4), because other nodes will forward to those URLs.
 
 ### 9.3 Device session (WebSocket)
 
@@ -582,7 +587,7 @@ All messages are JSON objects with `t` (type). Requests carry `id` (a string cho
 ← { "t": "challenge", "nonce": "<32 random bytes>" }
 
 → { "t": "auth",
-    "uid": "<uid>", "dev_pk": "<dev_pk>",
+    "uid": "<uid>", "domain": "7kas.com", "dev_pk": "<dev_pk>",
     "nonce": "<the same>", "host": "node.7kas.com",
     "push": { "gateway": "https://push.7ks.app", "token": "<opaque>" },
     "sig": "<Ed25519 signature with dev_pk of JCS({uid, dev_pk, nonce, host})>" }
@@ -595,6 +600,7 @@ All messages are JSON objects with `t` (type). Requests carry `id` (a string cho
 ```
 
 - The node MUST check that `dev_pk` has a current entry for `uid`: in its own directory if responsible; by resolving (§7) if not. A node MAY accept as home devices of any domain; it need not be responsible for their directory.
+- `domain` is the domain of the device's address. It is not signed: a node that serves that domain's directory ignores it; any other node needs it to resolve (§7), and a wrong value makes the resolution fail and the session `unauthorized`.
 - `host` prevents a signature from being valid on another node. `nonce` prevents replay.
 - `push` is optional (§13). A desktop device does not send it.
 - `stun` lists STUN servers, at least the node's own. `relay` lists TURN servers the device may use, with credentials that SHOULD expire after 1 hour; the device MAY authenticate again to obtain new ones. Both lists MAY include other nodes that announce `roles.relay`. In the `webrtc` profile they are passed to the WebRTC stack as its ICE servers.
@@ -604,9 +610,9 @@ All messages are JSON objects with `t` (type). Requests carry `id` (a string cho
 
 | Message | Response | Function |
 |---|---|---|
-| `{ "t": "resolve", "id": "…", "uid": "…" }` | `{ "t": "record", "id", "record" }` · `{ "t": "error", "id", "code": "not_found" }` | The node runs §7 on behalf of the device |
-| `{ "t": "connect", "id": "…", "env": {…} }` | `{ "t": "sent", "id", "devices": ["<dev_pk>", …] }` · `{ "t": "offline", "id" }` · `{ "t": "error", "id", "code": "unknown" }` | Deliver a signaling envelope (§10) to the online devices of the target |
-| `{ "t": "watch", "id": "…", "uid": "…", "ttl": 604800 }` | `{ "t": "ok", "id" }` · `{ "t": "error", "id", "code": "limit" }` | Notify when `uid` is online (§12) |
+| `{ "t": "resolve", "id": "…", "uid": "…", "domain": "…" }` | `{ "t": "record", "id", "record" }` · `{ "t": "error", "id", "code": "not_found" }` · `{ "t": "error", "id", "code": "unavailable" }` | The node runs §7 on behalf of the device with (`uid`, `domain`) |
+| `{ "t": "connect", "id": "…", "env": {…} }` | `{ "t": "sent", "id", "devices": ["<dev_pk>", …] }` · `{ "t": "offline", "id" }` · `{ "t": "error", "id", "code": "unknown" }` · `{ "t": "error", "id", "code": "unavailable" }` | Deliver a signaling envelope (§10) to the online devices of the target, through its home when that is another node (§9.4) |
+| `{ "t": "watch", "id": "…", "uid": "…", "domain": "…", "ttl": 604800 }` | `{ "t": "ok", "id" }` · `{ "t": "error", "id", "code": "limit" }` · `{ "t": "error", "id", "code": "unavailable" }` | Notify when `uid` is online (§12) |
 | `{ "t": "unwatch", "id": "…", "uid": "…" }` | `{ "t": "ok", "id" }` | |
 | `{ "t": "subscribe", "id": "…", "uids": ["…"] }` | `{ "t": "ok", "id" }` | Receive `record_changed` for those `uid`s during the session |
 | `{ "t": "block", "id": "…", "uid": "…" }` / `unblock` | `{ "t": "ok", "id" }` | The node discards everything coming from `uid` to this user |
@@ -625,27 +631,46 @@ Semantics of `connect`:
 - `sent` says which devices the envelope was delivered to (those with a session) or which were sent a push with the envelope held (§13). It does not guarantee they have read it.
 - `offline`: no device of the target has a session or a registered push. The envelope is discarded.
 - `unknown`: the `uid` does not exist or has blocked the origin. They are indistinguishable by design.
-- A node MUST validate that `env.from.uid` and `env.from.dev` match the sending session; otherwise `error invalid`.
+- `unavailable`: the target's node could not be reached or did not answer in time (§9.4). Nothing was delivered; the client keeps the content and retries later. It is not `offline`: a `watch` would not reach that node either.
+- A node MUST validate that `env.from.uid` and `env.from.dev` match the sending session and that `env.from.domain` is the domain that session authenticated with; otherwise `error invalid`.
 
 ### 9.4 Between nodes
 
-Nodes talk to each other over HTTPS with the same objects. Each node-to-node request carries:
+Nodes talk to each other over HTTPS with the same objects. A node calls another one only in four situations: it is the home of a device that sends to a user of the other node (`POST /relay`); it is the home of a watcher (`POST /watch`); it is the home of a target someone is watching (`POST /online`); or both are shard nodes of the same prefix (`GET /sync`). Each node-to-node request carries:
 
 ```
-Authorization: 7ks-node <nid> <ts> <sig>
-sig = base64url( Ed25519_sign( node_pk, JCS({ "method": "POST", "path": "/7ks/v1/relay", "ts": 1762560000, "body_sha256": "<base64url>" }) ) )
+Authorization: 7ks-node <nid> <url> <ts> <sig>
+sig = base64url( Ed25519_sign( node_pk, JCS({ "method": "POST", "path": "/7ks/v1/relay", "host": "bfc9.7ks.app", "ts": 1762560000, "body_sha256": "<base64url>" }) ) )
 ```
 
-The receiver MUST reject `ts` differing by more than 5 minutes (`401`) and MUST know `node_pk`: it obtains it from `GET /node` at the URL matching `nid` in the shard table or in the DNS entry of the domain the node claims to serve. A node that cannot bind `nid` to any known URL rejects the request.
+- `url` is the caller's base URL as a node: the `url` of its node record (§4.4) or an alias of it under the naming convention of its federation (Annex A). The caller uses the one of its names that appears in the `homes` of the user it speaks for.
+- `host` is the receiver's name as the caller addressed it (the host of the URL it used). The receiver MUST check that it is one of its own names; a request signed for another node is `401`.
+- `ts` is the caller's clock, in seconds. The receiver MUST reject a difference of more than 5 minutes (`401`). Nodes keep their clocks synchronised (NTP).
+- The receiver SHOULD remember (`nid`, `ts`, `body_sha256`) for 5 minutes and reject a repetition (`401`).
+
+**Binding `nid` to a node.** Before trusting a signature, the receiver MUST fetch `GET <url>/7ks/v1/node`, check that the record validates, that `nid = sha256(node_pk)` and that the record's `url` is `url` or that `url` is an alias of it under the naming convention. It MAY cache the binding until the record's `exp` and at most 24 hours; when a signature fails against a cached binding, it fetches the record once more before rejecting. Binding proves who is calling, not that the caller may: the content decides.
+
+| Route | The caller is legitimate when `url` … |
+|---|---|
+| `POST /relay` | is one of the `homes` of the entry `env.from.dev` in the validated record of (`env.from.uid`, `env.from.domain`), resolved per §7 |
+| `POST /watch` | equals `watcher_home` and is one of the `homes` of the watcher in the validated record of (`watcher_uid`, `watcher_domain`) |
+| `POST /online` | is the node this receiver sent the matching watch to: a node keeps the watches it has forwarded (watcher, target, target's node) until they expire and accepts `online` only for one of them |
+| `GET /sync` | is a node that the shard table assigns to that prefix |
+
+A request whose caller is not legitimate is `403`. This is what makes limits per caller node meaningful: a node can only speak for the users it is the home of, and a stranger who runs a node cannot flood another node in the name of invented users.
 
 | Route | Body | Function |
 |---|---|---|
 | `POST /relay` | `{ "env": {…} }` | Deliver an envelope to a device of this node. Responds like `connect`: `{ "status": "sent" \| "offline" \| "unknown", "devices": [...] }` |
-| `POST /watch` | `{ "watch": {…} }` | Register a watch on this node (it is the target's node) |
-| `POST /online` | `{ "uid": "<target>", "watcher_uid": "<uid>" }` | Tell this node that a target of one of its users is online |
+| `POST /watch` | `{ "watch": {…} }` | Register a watch (§4.6) on this node, which is the target's node |
+| `POST /online` | `{ "uid": "<target>", "watcher_uid": "<uid>" }` | Tell this node that a target one of its users was waiting for is online |
 | `GET /sync/<prefix>?since=<ts>` | — | Entries and revocations of the prefix modified since `since` (only between shard nodes of the same prefix) |
 
-A node that receives a `connect` or a `watch` for a `uid` that is not its own MUST resolve (§7) and forward exactly once to the first available home of the target. A received `POST /relay` is never forwarded. A node SHOULD try the entry's `homes` in order and stop at the first that answers.
+**Forwarding.** A node that receives a `connect` or a `watch` for a `uid` it is not the home of MUST resolve (§7) with the `domain` the device gave, take the `homes` of the target entry (`to.dev`), or of every entry when `to.dev = "*"`, and forward exactly once to the first home that answers, in the entry's order. A received `POST /relay` is never forwarded. Before contacting a home the node MUST check that it is a node: scheme `https`; a host name that resolves to a public unicast address, never loopback, private, link-local, carrier-grade NAT, multicast or reserved ranges (the address rule); and a valid node record at `<home>/7ks/v1/node` whose `url` is that home or of which that home is an alias, cached as above. A home that fails any check is skipped. The node does not start a `/relay` when `env.exp` is less than 5 s away, and answers `unavailable` when no home answered. The answer of the home (`sent`, `offline`, `unknown`) is passed to the device unchanged.
+
+**Timeouts and limits.** Connection 5 s, whole request 10 s; at most 4 homes per entry, one attempt per home per envelope. A node SHOULD keep connections to frequent nodes open, SHOULD stop calling a node that has failed repeatedly for 30 s and answer `unavailable` meanwhile, and SHOULD limit requests per caller node and per `from.uid`.
+
+**What a node needs to talk to other nodes.** Its node key and signed node record served at `/node` (§4.4), with `exp` renewed before it lapses; the parameters of its federation (§6) and the current table or naming convention; a DNS resolver with the caches of §5.1; an HTTPS client that verifies certificates, follows at most one `307` and applies the address rule; the caches of §7 (validated records, at most 1 hour) and of this section (node records and bindings, at most 24 hours); the replay memory; the watches it stores (§4.6) and the watches it has forwarded.
 
 ---
 
@@ -660,8 +685,8 @@ What the node transports. The node sees target, origin and expiry; the content i
 ```json
 {
   "id": "<uuid v4>",
-  "to":   { "uid": "<uid>", "dev": "<dev_pk> | *" },
-  "from": { "uid": "<uid>", "dev": "<dev_pk>" },
+  "to":   { "uid": "<uid>", "domain": "example.com", "dev": "<dev_pk> | *" },
+  "from": { "uid": "<uid>", "domain": "7kas.com", "dev": "<dev_pk>" },
   "exp": 1762560120,
   "body": "<base64url>"
 }
@@ -671,6 +696,7 @@ What the node transports. The node sees target, origin and expiry; the content i
 - `exp`: MUST NOT exceed `now + 120 s`. A node that cannot deliver before `exp` discards the envelope. **A node MUST NOT queue envelopes**: if the target is not online at that moment, it answers `offline`. The only retention allowed is the push one (§13).
 - `body` ≤ 16 KB.
 - `id` lets a receiver discard duplicates for 5 minutes.
+- `to.domain` and `from.domain` are the domains of the two addresses, in lower case. A `uid` cannot be reversed and resolution (§7) needs the domain: the sender's home uses `to.domain` to find the target's node; the receiver uses `from.domain` to verify `from_dev` (§10.2); the target's node uses it to check who is calling (§9.4). The sending node checks `from.domain` against the session. The address itself travels only inside the sealed body, in the application protocol, and the receiver checks that its hash is `from.uid` before showing it.
 
 ### 10.2 Body
 
@@ -682,7 +708,7 @@ body  = sealed_box( target's dev_dh, inner )
 The receiver MUST, in this order:
 
 1. Open the sealed box with its X25519 private key. If it fails, discard.
-2. Check that `from_dev` is a current `dev_pk` of `from.uid`; if it is not cached, resolve (§7). If it is not, discard.
+2. Check that `from_dev` is a current `dev_pk` of `from.uid`; if it is not cached, resolve (§7) with `from.domain`. If it is not, discard.
 3. Verify `sig` with `from_dev`. If it fails, discard.
 
 A body that fails validation is never answered. Because the body is signed by `dev_pk` and readable only by the target, everything it contains is bound to the sender's identity. This is what lets both profiles authenticate the channel without certificates: the `noise` profile rests the handshake's static key on it; the `webrtc` profile, the DTLS fingerprint.
@@ -918,7 +944,7 @@ A1 (uid A)              A's home (N)               B's home (M)               B1
 
 Rules:
 
-1. When `connect` answers `offline`, the client keeps the content in its own store and sends `watch` with `ttl` ≤ 7 days. Its home forwards it to the target's home (resolving).
+1. When `connect` answers `offline`, the client keeps the content in its own store and sends `watch` with `domain` and `ttl` ≤ 7 days. Its home forwards it to the target's home (resolving) as `POST /watch`, with `watcher_domain` and with `watcher_home` set to the one of its own names that appears in the watcher's `homes`, and keeps a copy of what it forwarded in order to accept the `online` (§9.4).
 2. When a device of the target opens a session, its home goes through the watches with that `target_uid` and, for each one: if the watcher is connected to this same node, it sends it `online`; otherwise, `POST /online` to `watcher_home`, which delivers it over the session or turns it into a silent push. The watch is deleted when emitted.
 3. The watcher, on receiving `online`, does `connect` and delivers over the direct channel.
 4. If the watcher did not receive the notice (it was off and the push did not wake it), it retries on startup.
@@ -963,6 +989,7 @@ HTTP responses use standard codes and a body `{ "error": "<code>", "detail": "<f
 | `offline` | — | No device of the target has a session or push (session only) |
 | `limit` | 429 | Quota exceeded |
 | `unauthorized` | 401 | Invalid session or node authentication |
+| `unavailable` | 503 | The node responsible for the target could not be reached or did not answer in time; retry later |
 
 ---
 
@@ -989,6 +1016,10 @@ HTTP responses use standard codes and a body `{ "error": "<code>", "detail": "<f
 | Rekey (`noise`) | 120 s or 2⁶⁰ packets |
 | Packet payload (`noise`) | ≤ 1200 bytes |
 | Envelope duplicate memory | 5 minutes |
+| Node-to-node request: connection / total | 5 s / 10 s |
+| Node-to-node: homes tried per entry / circuit breaker | 4 / 30 s |
+| Node caches: validated records / node records and bindings | 1 hour / 24 hours |
+| Node-to-node replay memory | 5 minutes |
 
 ---
 
@@ -1007,6 +1038,8 @@ HTTP responses use standard codes and a body `{ "error": "<code>", "detail": "<f
 **Handshake abuse.** `handshake_init` costs the receiver two Diffie-Hellman operations. A receiver under load MAY rate-limit by source address; since the initiator retransmits, legitimate sessions survive. The timestamp prevents replaying a captured `handshake_init`. DTLS has its own cookie mechanism.
 
 **Enumeration.** The `uid` is an unsalted hash, so whoever has a list of email addresses can check which ones are in the public directory. This is accepted: the directory returns no emails, only keys, and domains with their own node do not appear in it.
+
+**Open forwarding.** A node forwards only to URLs that resolution produced and that prove to be nodes (§9.4), never to a URL a client or an entry names on its own, and it accepts forwarded requests only from nodes that are homes of the users they speak for. Without the first rule a node would be a proxy towards arbitrary hosts, including its own private network; without the second, anyone able to run a node could flood any other node in the name of invented users, and `online` notices would become a push-spam channel.
 
 **Connection spam.** An `offer` only reaches a device with an open session, and the application decides whether to bother the user. `block` cuts off the rest. Nodes SHOULD rate-limit `connect` per origin.
 
@@ -1042,6 +1075,8 @@ HTTP responses use standard codes and a body `{ "error": "<code>", "detail": "<f
 
 The operator of the public federation publishes, outside this document: admission criteria for shard nodes, neutrality commitment, replica restoration period and `fed_pk` rotation procedure.
 
+**Naming convention.** The public federation publishes its shard nodes as host names: the prefix `p` of the public directory (`uid[0..2]`) is served at `https://<p as 4 lowercase hex digits>.7ks.app`, from `0000.7ks.app` to `ffff.7ks.app`. A client or node of this federation MAY derive the node of a prefix from the name without downloading the table; the table remains the authority and is published at the bootstrap URL. All the names of one node are aliases of its node record (`url`), and a record obtained at any of them is accepted for the others with the same `nid`. Every device of an address lives at the name of its prefix: the `homes` of public entries, `watcher_home` and the `host` of sessions name it. Moving a prefix to another node is a change of that name's DNS record after replication (§6, `GET /sync`); meanwhile the previous node answers `307` on reads and `403 not_responsible` on writes for that prefix (§9.1, §9.2).
+
 ## Annex B. Complete examples
 
 ### B.1 Call within the same domain
@@ -1049,7 +1084,7 @@ The operator of the public federation publishes, outside this document: admissio
 A is `garacil@7kas.com`, device A1 (native, `noise` and `webrtc`), connected to the domain node N (`https://node.7kas.com`). B is `soporte@7kas.com`, devices B1 (native) and B2 (browser, `webrtc` only), same node.
 
 ```
-A1 → N   ws  {t:"resolve", id:"1", uid:<B>}
+A1 → N   ws  {t:"resolve", id:"1", uid:<B>, domain:"7kas.com"}
 N  → A1  ws  {t:"record", id:"1", record:{devices:[B1, B2]}}        // A1 validates domainsig and pins keys
 A1       opens its UDP socket, queries STUN, gathers ICE candidates; also prepares a PeerConnection for B2
 A1 → N   ws  {t:"connect", id:"2", env:{to:{uid:<B>, dev:B1}, from:{uid:<A>, dev:A1}, exp,
@@ -1075,10 +1110,10 @@ Had B2 answered first, the session would use `webrtc`: A1 applies B2's SDP answe
 A is `garacil@7kas.com` on N. C is `cliente@otra.com`; `otra.com` has no node of its own and C1 is homed at the public node P.
 
 ```
-A1 → N   ws  {t:"resolve", id:"1", uid:<C>}
+A1 → N   ws  {t:"resolve", id:"1", uid:<C>, domain:"otra.com"}
 N        DNS _7ks.otra.com → none; prefix = uid_C[0..2]; GET at a shard node → record with attestation
 N  → A1  ws  {t:"record", id:"1", record:{devices:[C1 {homes:["https://p.example"]}]}}   // A1 validates the attestation against verifiers
-A1 → N   ws  {t:"connect", id:"2", env:{to:{uid:<C>, dev:C1}, from:{uid:<A>, dev:A1}, exp, body:sealed(C1, offer{apps:["7ks-chat/1"], …})}}
+A1 → N   ws  {t:"connect", id:"2", env:{to:{uid:<C>, domain:"otra.com", dev:C1}, from:{uid:<A>, domain:"7kas.com", dev:A1}, exp, body:sealed(C1, offer{apps:["7ks-chat/1"], …})}}
 N        C is not its own; resolves; POST https://p.example/7ks/v1/relay {env} with Authorization 7ks-node
 P  → C1  ws  {t:"deliver", env}
 C1 → P   ws  {t:"connect", env:{to:{uid:<A>, dev:A1}, body:sealed(A1, answer{…})}}
@@ -1144,6 +1179,7 @@ What an implementation MUST satisfy, per role, to call itself 7KSP/1. Each item 
 - Runs full ICE, over one socket, with simultaneous probes and peer-reflexive candidates (§11.2).
 - Verifies the identity of the other end when establishing the channel (§11.4 or §11.5) and aborts on mismatch.
 - Retries pending work on startup and on network recovery, and uses watches (§12).
+- Sends `domain` with `auth`, `resolve` and `watch` and in both ends of every envelope (§9.3, §10.1), and never the address itself outside the sealed body.
 
 **Native client, additionally**: full `noise` profile (§11.4, Annex C), `endpoints` if any (§11.7), mobile behaviour (§11.10).
 **Web client, additionally**: `webrtc` profile (§11.5), announcing only that profile.
@@ -1153,7 +1189,7 @@ What an implementation MUST satisfy, per role, to call itself 7KSP/1. Each item 
 - Authenticates sessions by challenge and checks the device entry (§9.3).
 - Never queues envelopes except the push retention (§10.1, §13).
 - Delivers `connect` only to devices with a session; answers `offline` and `unknown` per §9.3.
-- Forwards to other nodes exactly once and authenticates node-to-node requests (§9.4).
+- Forwards to other nodes exactly once, only to verified nodes on public addresses, authenticates node-to-node requests, accepts them only from the homes of the users they speak for, and answers `unavailable` when the other node cannot be reached (§9.4).
 - Stores and processes watches per §12.
 - Runs STUN (§11.2).
 - Applies the limits of §15.
@@ -1168,6 +1204,7 @@ What an implementation MUST satisfy, per role, to call itself 7KSP/1. Each item 
 
 ## History
 
+- **0.6 (draft, unreleased)** — Contact between nodes completed: `domain` beside every `uid` a node has to resolve (`auth`, `resolve`, `watch`, the two ends of the envelope, the watch object); node-to-node authentication binds the caller to the users it speaks for and the request to the receiver (`url` in `Authorization`, `host` in the signed object, replay memory); forwarding only to verified nodes on public addresses; `homes` checked on write; `unavailable` error; node caches, timeouts and circuit breaker; naming convention of the public federation (Annex A).
 - **0.5** — Rewrite for maximum detail and clarity: glossary, conformance levels per role, the journey of a connection, validation and resolution algorithms in pseudocode, sealed box specified, session state machine, several devices, exact semantics of `connect`, renewal and account recovery, step-by-step NAT explanation, mobile section, cross-domain and deferred-delivery examples, conformance checklist. No wire-format changes relative to 0.4 except: `bye` carries `reason`; `revoke` carries `type`; WebSocket subprotocol `7ksp.v1`; AEAD nonce defined explicitly.
 - **0.4** — Two transport profiles under one protocol: `noise` (native) and `webrtc` (browsers and natives wanting to reach them), negotiated per session with `transports` in device entries and in `offer`/`answer`; identical guarantees, both without certificate authorities; application primitives mapped to each profile; web clients back in scope as `webrtc`-only clients.
 - **0.3** — Direct channel redefined: UDP only; `Noise_IK` handshake with the devices' `dev_dh` keys instead of TLS/DTLS; no certificates or SDP; full ICE requirements; packet format and primitives; reliable streams in Annex C; `endpoints`; `stun` and `roles.relay` in node records.

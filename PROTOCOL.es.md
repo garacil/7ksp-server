@@ -1,6 +1,6 @@
 # 7KSP/1 — Protocolo 7ks
 
-Versión del protocolo: 1. Estado del documento: borrador 0.5.
+Versión del protocolo: 1. Estado del documento: borrador 0.6 (borrador, sin publicar).
 
 7KSP es un protocolo abierto y libre que, a partir de una dirección de email, abre un canal directo, cifrado y autenticado entre dos dispositivos. Este documento contiene todo lo necesario para implementar un cliente o un nodo interoperable sin consultar ninguna otra fuente. Está escrito para que una implementación completa quepa en unos pocos miles de líneas en cualquier lenguaje, usando solo componentes estándar: HTTPS y WebSocket hacia los nodos, JSON, Ed25519, X25519, el framework Noise, STUN, UDP y, cuando interviene un navegador, WebRTC.
 
@@ -362,8 +362,11 @@ Un nodo DEBE omitir las entradas caducadas al servirlo. Un cliente DEBE descarta
 Lo único que un nodo almacena de forma persistente sobre el tráfico. Vive en el nodo del destinatario.
 
 ```json
-{ "watcher_uid": "<uid>", "watcher_home": "https://nodeA.example", "target_uid": "<uid>", "exp": 1763164800 }
+{ "watcher_uid": "<uid>", "watcher_domain": "example.com", "watcher_home": "https://nodeA.example", "target_uid": "<uid>", "exp": 1763164800 }
 ```
+
+- `watcher_domain` es el dominio de la dirección del vigilante; el nodo del destinatario lo usa para comprobar que el nodo que registra la vigilancia es un home del vigilante (§9.4).
+- `watcher_home` es la URL en la que el nodo del vigilante quiere recibir `online`: uno de los `homes` de la entrada del vigilante.
 
 ---
 
@@ -449,6 +452,8 @@ resolve(email):
        Si todos respondieron 404 → NO EXISTE. Si ninguno respondió → "no disponible".
 ```
 
+**Resolución por un nodo.** Cuando un nodo resuelve en nombre de un dispositivo (`auth` de un dispositivo cuyo directorio no sirve, `resolve`, `connect`, `watch`), recibe del dispositivo `uid` y `domain`: el dominio no puede recuperarse del `uid` y sin él el paso 2 es imposible. El nodo ejecuta el mismo algoritmo con el par (`uid`, `domain`) en lugar de la dirección, valida las entradas exactamente como lo haría un cliente y PUEDE cachear el registro validado hasta el `exp` más pequeño de sus entradas y como máximo 1 hora. Un nodo NO DEBE consultar ni reenviar a ninguna URL que el algoritmo no haya producido: la `url` de la entrada DNS del dominio, los nodos que la tabla (o la convención de nombres del Anexo A) asigna al prefijo y los `homes` de entradas validadas, cada uno comprobado como en el §9.4.
+
 ### 7.1 Fijación de claves (TOFU)
 
 ```
@@ -466,8 +471,8 @@ pin(uid, entradas, dom_pk):
 ### 7.2 Caché y refresco
 
 - Un cliente DEBERÍA cachear un registro hasta el `exp` más pequeño de sus entradas y como máximo 24 horas.
-- Un cliente DEBERÍA suscribirse (§9.3 `subscribe`) a los `uid` con los que habla con frecuencia, para recibir `record_changed` y volver a resolver sin esperar a la caducidad.
-- Un cliente PUEDE delegar los pasos 2 y 3 en su home con `resolve` (§9.3). El home ejecuta el mismo algoritmo. El cliente DEBE validar igualmente el resultado: el home es un transporte, no una autoridad.
+- Un cliente DEBERÍA suscribirse (§9.3 `subscribe`) a los `uid` con los que habla con frecuencia, para recibir `record_changed` y volver a resolver sin esperar a la caducidad. Un nodo emite `record_changed` para los `uid` cuyo directorio sirve; para los demás no está garantizado, así que un cliente DEBERÍA volver a resolver a un contacto alojado en otro nodo cuando su registro en caché tenga más de 1 hora al iniciar una sesión con él, y tras cualquier `unknown` o fallo de validación.
+- Un cliente PUEDE delegar los pasos 2 y 3 en su home con `resolve` (§9.3), pasando `uid` y `domain`. El home ejecuta el mismo algoritmo. El cliente DEBE validar igualmente el resultado: el home es un transporte, no una autoridad.
 
 ---
 
@@ -568,7 +573,7 @@ Estas rutas NO DEBEN exigir autenticación ni limitar por origen más allá de l
 | `GET /verify/<req_id>` | — | `200 {proof}` · `202` · `410 expired` |
 | `GET /verify/<token>/confirm` | — | página HTML de confirmación; marca el token como usado |
 
-Un nodo es responsable de un `uid` si: es el nodo de dominio de ese dominio, o es un nodo de shard del prefijo y el dominio no tiene entrada DNS. En cualquier otro caso responde `403` con `{ "error": "not_responsible", "responsible": ["<url>", "…"] }` si lo sabe. `PUT` y `DELETE` no necesitan sesión: el objeto lleva su propia autoridad.
+Un nodo es responsable de un `uid` si: es el nodo de dominio de ese dominio, o es un nodo de shard del prefijo y el dominio no tiene entrada DNS. En cualquier otro caso responde `403` con `{ "error": "not_responsible", "responsible": ["<url>", "…"] }` si lo sabe. `PUT` y `DELETE` no necesitan sesión: el objeto lleva su propia autoridad. Un nodo DEBE rechazar (`invalid`) una entrada cuyos `homes` contengan una URL que no sea `https` o cuyo host no supere la regla de direcciones del §9.4, y DEBERÍA además exigir un registro de nodo válido en cada una (§9.4), porque otros nodos reenviarán a esas URL.
 
 ### 9.3 Sesión del dispositivo (WebSocket)
 
@@ -582,7 +587,7 @@ Todos los mensajes son objetos JSON con `t` (tipo). Las peticiones llevan `id` (
 ← { "t": "challenge", "nonce": "<32 bytes aleatorios>" }
 
 → { "t": "auth",
-    "uid": "<uid>", "dev_pk": "<dev_pk>",
+    "uid": "<uid>", "domain": "7kas.com", "dev_pk": "<dev_pk>",
     "nonce": "<el mismo>", "host": "node.7kas.com",
     "push": { "gateway": "https://push.7ks.app", "token": "<opaco>" },
     "sig": "<firma Ed25519 con dev_pk de JCS({uid, dev_pk, nonce, host})>" }
@@ -595,6 +600,7 @@ Todos los mensajes son objetos JSON con `t` (tipo). Las peticiones llevan `id` (
 ```
 
 - El nodo DEBE comprobar que `dev_pk` tiene una entrada vigente para `uid`: en su propio directorio si es responsable; resolviendo (§7) si no. Un nodo PUEDE aceptar como home dispositivos de cualquier dominio; no necesita ser responsable de su directorio.
+- `domain` es el dominio de la dirección del dispositivo. No va firmado: un nodo que sirve el directorio de ese dominio lo ignora; cualquier otro lo necesita para resolver (§7), y un valor erróneo hace fallar la resolución y la sesión es `unauthorized`.
 - `host` impide que una firma sea válida en otro nodo. `nonce` impide la repetición.
 - `push` es opcional (§13). Un dispositivo de escritorio no lo envía.
 - `stun` enumera servidores STUN, al menos el del propio nodo. `relay` enumera servidores TURN que el dispositivo puede usar, con credenciales que DEBERÍAN caducar al cabo de 1 hora; el dispositivo PUEDE volver a autenticarse para obtener otras. Ambas listas PUEDEN incluir otros nodos que anuncien `roles.relay`. En el perfil `webrtc` se pasan a la pila WebRTC como sus servidores ICE.
@@ -604,9 +610,9 @@ Todos los mensajes son objetos JSON con `t` (tipo). Las peticiones llevan `id` (
 
 | Mensaje | Respuesta | Función |
 |---|---|---|
-| `{ "t": "resolve", "id": "…", "uid": "…" }` | `{ "t": "record", "id", "record" }` · `{ "t": "error", "id", "code": "not_found" }` | El nodo ejecuta §7 en nombre del dispositivo |
-| `{ "t": "connect", "id": "…", "env": {…} }` | `{ "t": "sent", "id", "devices": ["<dev_pk>", …] }` · `{ "t": "offline", "id" }` · `{ "t": "error", "id", "code": "unknown" }` | Entregar un sobre de señalización (§10) a los dispositivos en línea del destinatario |
-| `{ "t": "watch", "id": "…", "uid": "…", "ttl": 604800 }` | `{ "t": "ok", "id" }` · `{ "t": "error", "id", "code": "limit" }` | Avisar cuando `uid` esté en línea (§12) |
+| `{ "t": "resolve", "id": "…", "uid": "…", "domain": "…" }` | `{ "t": "record", "id", "record" }` · `{ "t": "error", "id", "code": "not_found" }` · `{ "t": "error", "id", "code": "unavailable" }` | El nodo ejecuta §7 en nombre del dispositivo con (`uid`, `domain`) |
+| `{ "t": "connect", "id": "…", "env": {…} }` | `{ "t": "sent", "id", "devices": ["<dev_pk>", …] }` · `{ "t": "offline", "id" }` · `{ "t": "error", "id", "code": "unknown" }` · `{ "t": "error", "id", "code": "unavailable" }` | Entregar un sobre de señalización (§10) a los dispositivos en línea del destinatario, a través de su home cuando es otro nodo (§9.4) |
+| `{ "t": "watch", "id": "…", "uid": "…", "domain": "…", "ttl": 604800 }` | `{ "t": "ok", "id" }` · `{ "t": "error", "id", "code": "limit" }` · `{ "t": "error", "id", "code": "unavailable" }` | Avisar cuando `uid` esté en línea (§12) |
 | `{ "t": "unwatch", "id": "…", "uid": "…" }` | `{ "t": "ok", "id" }` | |
 | `{ "t": "subscribe", "id": "…", "uids": ["…"] }` | `{ "t": "ok", "id" }` | Recibir `record_changed` de esos `uid` durante la sesión |
 | `{ "t": "block", "id": "…", "uid": "…" }` / `unblock` | `{ "t": "ok", "id" }` | El nodo descarta todo lo que llegue de `uid` a este usuario |
@@ -625,27 +631,46 @@ Semántica de `connect`:
 - `sent` indica a qué dispositivos se entregó el sobre (los que tienen sesión) o a cuáles se envió un push con el sobre retenido (§13). No garantiza que lo hayan leído.
 - `offline`: ningún dispositivo del destinatario tiene sesión ni push registrado. El sobre se descarta.
 - `unknown`: el `uid` no existe o ha bloqueado al origen. Son indistinguibles por diseño.
-- Un nodo DEBE validar que `env.from.uid` y `env.from.dev` coinciden con la sesión que envía; si no, `error invalid`.
+- `unavailable`: no se pudo contactar con el nodo del destinatario o no respondió a tiempo (§9.4). No se entregó nada; el cliente guarda el contenido y reintenta más tarde. No es `offline`: una `watch` tampoco llegaría a ese nodo.
+- Un nodo DEBE validar que `env.from.uid` y `env.from.dev` coinciden con la sesión que envía y que `env.from.domain` es el dominio con el que esa sesión se autenticó; si no, `error invalid`.
 
 ### 9.4 Entre nodos
 
-Los nodos se comunican entre sí por HTTPS con los mismos objetos. Cada petición entre nodos lleva:
+Los nodos se comunican entre sí por HTTPS con los mismos objetos. Un nodo llama a otro solo en cuatro situaciones: es el home de un dispositivo que envía a un usuario del otro nodo (`POST /relay`); es el home de un vigilante (`POST /watch`); es el home de un destinatario al que alguien vigila (`POST /online`); o ambos son nodos de shard del mismo prefijo (`GET /sync`). Cada petición entre nodos lleva:
 
 ```
-Authorization: 7ks-node <nid> <ts> <sig>
-sig = base64url( Ed25519_sign( node_pk, JCS({ "method": "POST", "path": "/7ks/v1/relay", "ts": 1762560000, "body_sha256": "<base64url>" }) ) )
+Authorization: 7ks-node <nid> <url> <ts> <sig>
+sig = base64url( Ed25519_sign( node_pk, JCS({ "method": "POST", "path": "/7ks/v1/relay", "host": "bfc9.7ks.app", "ts": 1762560000, "body_sha256": "<base64url>" }) ) )
 ```
 
-El receptor DEBE rechazar un `ts` que difiera en más de 5 minutos (`401`) y DEBE conocer `node_pk`: lo obtiene de `GET /node` en la URL que corresponde a `nid` en la tabla de shards o en la entrada DNS del dominio que el nodo dice servir. Un nodo que no puede asociar `nid` a ninguna URL conocida rechaza la petición.
+- `url` es la URL base del llamante como nodo: la `url` de su registro de nodo (§4.4) o un alias de ella según la convención de nombres de su federación (Anexo A). El llamante usa el nombre suyo que aparece en los `homes` del usuario por el que habla.
+- `host` es el nombre del receptor tal como lo direccionó el llamante (el host de la URL que usó). El receptor DEBE comprobar que es uno de sus nombres; una petición firmada para otro nodo es `401`.
+- `ts` es el reloj del llamante, en segundos. El receptor DEBE rechazar una diferencia de más de 5 minutos (`401`). Los nodos mantienen el reloj sincronizado (NTP).
+- El receptor DEBERÍA recordar (`nid`, `ts`, `body_sha256`) durante 5 minutos y rechazar una repetición (`401`).
+
+**Asociar `nid` a un nodo.** Antes de confiar en una firma, el receptor DEBE obtener `GET <url>/7ks/v1/node`, comprobar que el registro valida, que `nid = sha256(node_pk)` y que la `url` del registro es `url` o que `url` es un alias suyo según la convención de nombres. PUEDE cachear la asociación hasta el `exp` del registro y como máximo 24 horas; cuando una firma falla contra una asociación cacheada, vuelve a obtener el registro una vez antes de rechazar. La asociación demuestra quién llama, no que pueda hacerlo: lo decide el contenido.
+
+| Ruta | El llamante es legítimo cuando `url` … |
+|---|---|
+| `POST /relay` | es uno de los `homes` de la entrada `env.from.dev` en el registro validado de (`env.from.uid`, `env.from.domain`), resuelto según el §7 |
+| `POST /watch` | es igual a `watcher_home` y es uno de los `homes` del vigilante en el registro validado de (`watcher_uid`, `watcher_domain`) |
+| `POST /online` | es el nodo al que este receptor envió la vigilancia correspondiente: un nodo conserva las vigilancias que ha reenviado (vigilante, destinatario, nodo del destinatario) hasta que caducan y solo acepta `online` para una de ellas |
+| `GET /sync` | es un nodo que la tabla de shards asigna a ese prefijo |
+
+Una petición cuyo llamante no es legítimo es `403`. Esto es lo que da sentido a los límites por nodo llamante: un nodo solo puede hablar por los usuarios de los que es home, y un desconocido que opere un nodo no puede inundar a otro en nombre de usuarios inventados.
 
 | Ruta | Cuerpo | Función |
 |---|---|---|
 | `POST /relay` | `{ "env": {…} }` | Entregar un sobre a un dispositivo de este nodo. Responde como `connect`: `{ "status": "sent" \| "offline" \| "unknown", "devices": [...] }` |
-| `POST /watch` | `{ "watch": {…} }` | Registrar una vigilancia en este nodo (es el nodo del destinatario) |
-| `POST /online` | `{ "uid": "<destinatario>", "watcher_uid": "<uid>" }` | Avisar a este nodo de que un destinatario de uno de sus usuarios está en línea |
+| `POST /watch` | `{ "watch": {…} }` | Registrar una vigilancia (§4.6) en este nodo, que es el nodo del destinatario |
+| `POST /online` | `{ "uid": "<destinatario>", "watcher_uid": "<uid>" }` | Avisar a este nodo de que un destinatario al que esperaba uno de sus usuarios está en línea |
 | `GET /sync/<prefijo>?since=<ts>` | — | Entradas y revocaciones del prefijo modificadas desde `since` (solo entre nodos de shard del mismo prefijo) |
 
-Un nodo que recibe un `connect` o un `watch` para un `uid` que no es suyo DEBE resolver (§7) y reenviar exactamente una vez al primer home disponible del destinatario. Un `POST /relay` recibido nunca se reenvía. Un nodo DEBERÍA probar los `homes` de la entrada en orden y detenerse en el primero que responda.
+**Reenvío.** Un nodo que recibe un `connect` o una `watch` para un `uid` del que no es home DEBE resolver (§7) con el `domain` que le dio el dispositivo, tomar los `homes` de la entrada destinataria (`to.dev`), o de todas las entradas cuando `to.dev = "*"`, y reenviar exactamente una vez al primer home que responda, en el orden de la entrada. Un `POST /relay` recibido nunca se reenvía. Antes de contactar con un home el nodo DEBE comprobar que es un nodo: esquema `https`; un nombre de host que resuelve a una dirección unicast pública, nunca de loopback, privada, de enlace local, de NAT de operador, multicast ni reservada (la regla de direcciones); y un registro de nodo válido en `<home>/7ks/v1/node` cuya `url` sea ese home o de la que ese home sea alias, cacheado como arriba. Un home que falla cualquier comprobación se salta. El nodo no inicia un `/relay` cuando faltan menos de 5 s para `env.exp`, y responde `unavailable` cuando ningún home respondió. La respuesta del home (`sent`, `offline`, `unknown`) se pasa al dispositivo sin cambios.
+
+**Tiempos y límites.** Conexión 5 s, petición completa 10 s; como máximo 4 homes por entrada, un intento por home y sobre. Un nodo DEBERÍA mantener abiertas las conexiones con los nodos frecuentes, DEBERÍA dejar de llamar durante 30 s a un nodo que ha fallado repetidamente y responder `unavailable` mientras tanto, y DEBERÍA limitar las peticiones por nodo llamante y por `from.uid`.
+
+**Qué necesita un nodo para hablar con otros nodos.** Su clave de nodo y su registro de nodo firmado servido en `/node` (§4.4), con `exp` renovado antes de que venza; los parámetros de su federación (§6) y la tabla vigente o la convención de nombres; un resolutor DNS con las cachés del §5.1; un cliente HTTPS que verifica certificados, sigue como máximo un `307` y aplica la regla de direcciones; las cachés del §7 (registros validados, como máximo 1 hora) y de esta sección (registros de nodo y asociaciones, como máximo 24 horas); la memoria de repeticiones; las vigilancias que almacena (§4.6) y las que ha reenviado.
 
 ---
 
@@ -660,8 +685,8 @@ Lo que transporta el nodo. El nodo ve el destinatario, el origen y la caducidad;
 ```json
 {
   "id": "<uuid v4>",
-  "to":   { "uid": "<uid>", "dev": "<dev_pk> | *" },
-  "from": { "uid": "<uid>", "dev": "<dev_pk>" },
+  "to":   { "uid": "<uid>", "domain": "example.com", "dev": "<dev_pk> | *" },
+  "from": { "uid": "<uid>", "domain": "7kas.com", "dev": "<dev_pk>" },
   "exp": 1762560120,
   "body": "<base64url>"
 }
@@ -671,6 +696,7 @@ Lo que transporta el nodo. El nodo ve el destinatario, el origen y la caducidad;
 - `exp`: NO DEBE superar `ahora + 120 s`. Un nodo que no puede entregar antes de `exp` descarta el sobre. **Un nodo NO DEBE encolar sobres**: si el destinatario no está en línea en ese momento, responde `offline`. La única retención permitida es la del push (§13).
 - `body` ≤ 16 KB.
 - `id` permite a un receptor descartar duplicados durante 5 minutos.
+- `to.domain` y `from.domain` son los dominios de las dos direcciones, en minúsculas. Un `uid` no puede invertirse y la resolución (§7) necesita el dominio: el home del emisor usa `to.domain` para encontrar el nodo del destinatario; el receptor usa `from.domain` para verificar `from_dev` (§10.2); el nodo del destinatario lo usa para comprobar quién llama (§9.4). El nodo emisor comprueba `from.domain` contra la sesión. La dirección en sí viaja solo dentro del cuerpo sellado, en el protocolo de aplicación, y el receptor comprueba que su hash es `from.uid` antes de mostrarla.
 
 ### 10.2 Cuerpo
 
@@ -682,7 +708,7 @@ body  = sealed_box( dev_dh del destinatario, inner )
 El receptor DEBE, en este orden:
 
 1. Abrir la sealed box con su clave privada X25519. Si falla, descartar.
-2. Comprobar que `from_dev` es una `dev_pk` vigente de `from.uid`; si no la tiene en caché, resolver (§7). Si no lo es, descartar.
+2. Comprobar que `from_dev` es una `dev_pk` vigente de `from.uid`; si no la tiene en caché, resolver (§7) con `from.domain`. Si no lo es, descartar.
 3. Verificar `sig` con `from_dev`. Si falla, descartar.
 
 Un cuerpo que no supera la validación nunca se responde. Como el cuerpo va firmado por `dev_pk` y solo lo puede leer el destinatario, todo lo que contiene queda vinculado a la identidad del emisor. Esto es lo que permite a los dos perfiles autenticar el canal sin certificados: el perfil `noise` apoya en ello la clave estática del handshake; el perfil `webrtc`, la huella DTLS.
@@ -918,7 +944,7 @@ A1 (uid A)              Home de A (N)              Home de B (M)              B1
 
 Reglas:
 
-1. Cuando `connect` responde `offline`, el cliente guarda el contenido en su propio almacén y envía `watch` con `ttl` ≤ 7 días. Su home lo reenvía al home del destinatario (resolviendo).
+1. Cuando `connect` responde `offline`, el cliente guarda el contenido en su propio almacén y envía `watch` con `domain` y `ttl` ≤ 7 días. Su home lo reenvía al home del destinatario (resolviendo) como `POST /watch`, con `watcher_domain` y con `watcher_home` igual al nombre suyo que aparece en los `homes` del vigilante, y conserva una copia de lo reenviado para aceptar el `online` (§9.4).
 2. Cuando un dispositivo del destinatario abre una sesión, su home recorre las vigilancias con ese `target_uid` y, para cada una: si el vigilante está conectado a este mismo nodo, le envía `online`; si no, `POST /online` a `watcher_home`, que lo entrega por la sesión o lo convierte en un push silencioso. La vigilancia se borra al emitirse.
 3. El vigilante, al recibir `online`, hace `connect` y entrega por el canal directo.
 4. Si el vigilante no recibió el aviso (estaba apagado y el push no lo despertó), reintenta al arrancar.
@@ -963,6 +989,7 @@ Las respuestas HTTP usan códigos estándar y un cuerpo `{ "error": "<código>",
 | `offline` | — | Ningún dispositivo del destinatario tiene sesión ni push (solo en sesión) |
 | `limit` | 429 | Cuota superada |
 | `unauthorized` | 401 | Autenticación de sesión o de nodo no válida |
+| `unavailable` | 503 | No se pudo contactar con el nodo responsable del destinatario o no respondió a tiempo; reintentar más tarde |
 
 ---
 
@@ -989,6 +1016,10 @@ Las respuestas HTTP usan códigos estándar y un cuerpo `{ "error": "<código>",
 | Renovación de claves (`noise`) | 120 s o 2⁶⁰ paquetes |
 | Carga útil del paquete (`noise`) | ≤ 1200 bytes |
 | Memoria de duplicados de sobres | 5 minutos |
+| Petición entre nodos: conexión / total | 5 s / 10 s |
+| Entre nodos: homes probados por entrada / cortacircuitos | 4 / 30 s |
+| Cachés del nodo: registros validados / registros de nodo y asociaciones | 1 hora / 24 horas |
+| Memoria de repeticiones entre nodos | 5 minutos |
 
 ---
 
@@ -1007,6 +1038,8 @@ Las respuestas HTTP usan códigos estándar y un cuerpo `{ "error": "<código>",
 **Abuso del handshake.** Un `handshake_init` le cuesta al receptor dos operaciones Diffie-Hellman. Un receptor bajo carga PUEDE limitar la frecuencia por dirección de origen; como el iniciador retransmite, las sesiones legítimas sobreviven. La marca de tiempo impide repetir un `handshake_init` capturado. DTLS tiene su propio mecanismo de cookies.
 
 **Enumeración.** El `uid` es un hash sin sal, así que quien tenga una lista de direcciones de email puede comprobar cuáles están en el directorio público. Se acepta: el directorio no devuelve emails, solo claves, y los dominios con nodo propio no aparecen en él.
+
+**Reenvío abierto.** Un nodo reenvía solo a URL que la resolución ha producido y que demuestran ser nodos (§9.4), nunca a una URL que un cliente o una entrada nombren por su cuenta, y acepta peticiones reenviadas solo de nodos que son home de los usuarios por los que hablan. Sin la primera regla un nodo sería un proxy hacia hosts arbitrarios, incluida su propia red privada; sin la segunda, cualquiera capaz de operar un nodo podría inundar a otro en nombre de usuarios inventados, y los avisos `online` se convertirían en un canal de spam de push.
 
 **Spam de conexiones.** Una `offer` solo llega a un dispositivo con sesión abierta, y la aplicación decide si molesta al usuario. `block` corta el resto. Los nodos DEBERÍAN limitar la frecuencia de `connect` por origen.
 
@@ -1042,6 +1075,8 @@ Las respuestas HTTP usan códigos estándar y un cuerpo `{ "error": "<código>",
 
 El operador de la federación pública publica, fuera de este documento: los criterios de admisión de nodos de shard, el compromiso de neutralidad, el plazo de restauración de réplicas y el procedimiento de rotación de `fed_pk`.
 
+**Convención de nombres.** La federación pública publica sus nodos de shard como nombres de host: el prefijo `p` del directorio público (`uid[0..2]`) se sirve en `https://<p en 4 dígitos hexadecimales en minúsculas>.7ks.app`, de `0000.7ks.app` a `ffff.7ks.app`. Un cliente o nodo de esta federación PUEDE derivar el nodo de un prefijo a partir del nombre sin descargar la tabla; la tabla sigue siendo la autoridad y se publica en la URL de arranque. Todos los nombres de un nodo son alias de su registro de nodo (`url`), y un registro obtenido en cualquiera de ellos se acepta para los demás con el mismo `nid`. Todos los dispositivos de una dirección viven en el nombre de su prefijo: los `homes` de las entradas públicas, `watcher_home` y el `host` de las sesiones lo nombran. Mover un prefijo a otro nodo es cambiar el registro DNS de ese nombre tras la replicación (§6, `GET /sync`); mientras tanto el nodo anterior responde `307` en lecturas y `403 not_responsible` en escrituras de ese prefijo (§9.1, §9.2).
+
 ## Anexo B. Ejemplos completos
 
 ### B.1 Llamada dentro del mismo dominio
@@ -1049,7 +1084,7 @@ El operador de la federación pública publica, fuera de este documento: los cri
 A es `garacil@7kas.com`, dispositivo A1 (nativo, `noise` y `webrtc`), conectado al nodo de dominio N (`https://node.7kas.com`). B es `soporte@7kas.com`, dispositivos B1 (nativo) y B2 (navegador, solo `webrtc`), mismo nodo.
 
 ```
-A1 → N   ws  {t:"resolve", id:"1", uid:<B>}
+A1 → N   ws  {t:"resolve", id:"1", uid:<B>, domain:"7kas.com"}
 N  → A1  ws  {t:"record", id:"1", record:{devices:[B1, B2]}}        // A1 valida la domainsig y fija las claves
 A1       abre su socket UDP, consulta STUN, reúne candidatos ICE; también prepara una PeerConnection para B2
 A1 → N   ws  {t:"connect", id:"2", env:{to:{uid:<B>, dev:B1}, from:{uid:<A>, dev:A1}, exp,
@@ -1075,10 +1110,10 @@ Si hubiera respondido antes B2, la sesión usaría `webrtc`: A1 aplica la respue
 A es `garacil@7kas.com` en N. C es `cliente@otra.com`; `otra.com` no tiene nodo propio y el home de C1 es el nodo público P.
 
 ```
-A1 → N   ws  {t:"resolve", id:"1", uid:<C>}
+A1 → N   ws  {t:"resolve", id:"1", uid:<C>, domain:"otra.com"}
 N        DNS _7ks.otra.com → ninguno; prefijo = uid_C[0..2]; GET en un nodo de shard → registro con attestation
 N  → A1  ws  {t:"record", id:"1", record:{devices:[C1 {homes:["https://p.example"]}]}}   // A1 valida la attestation contra verifiers
-A1 → N   ws  {t:"connect", id:"2", env:{to:{uid:<C>, dev:C1}, from:{uid:<A>, dev:A1}, exp, body:sealed(C1, offer{apps:["7ks-chat/1"], …})}}
+A1 → N   ws  {t:"connect", id:"2", env:{to:{uid:<C>, domain:"otra.com", dev:C1}, from:{uid:<A>, domain:"7kas.com", dev:A1}, exp, body:sealed(C1, offer{apps:["7ks-chat/1"], …})}}
 N        C no es suyo; resuelve; POST https://p.example/7ks/v1/relay {env} con Authorization 7ks-node
 P  → C1  ws  {t:"deliver", env}
 C1 → P   ws  {t:"connect", env:{to:{uid:<A>, dev:A1}, body:sealed(A1, answer{…})}}
@@ -1144,6 +1179,7 @@ Lo que una implementación DEBE cumplir, según su papel, para llamarse 7KSP/1. 
 - Ejecuta ICE completo, sobre un único socket, con sondas simultáneas y candidatos peer-reflexive (§11.2).
 - Verifica la identidad del otro extremo al establecer el canal (§11.4 o §11.5) y aborta si no coincide.
 - Reintenta lo pendiente al arrancar y al recuperar la red, y usa vigilancias (§12).
+- Envía `domain` con `auth`, `resolve` y `watch` y en los dos extremos de cada sobre (§9.3, §10.1), y nunca la dirección en sí fuera del cuerpo sellado.
 
 **Cliente nativo, además**: perfil `noise` completo (§11.4, Anexo C), `endpoints` si los hay (§11.7), comportamiento móvil (§11.10).
 **Cliente web, además**: perfil `webrtc` (§11.5), anunciando solo ese perfil.
@@ -1153,7 +1189,7 @@ Lo que una implementación DEBE cumplir, según su papel, para llamarse 7KSP/1. 
 - Autentica las sesiones por desafío y comprueba la entrada del dispositivo (§9.3).
 - Nunca encola sobres, salvo la retención del push (§10.1, §13).
 - Entrega `connect` solo a dispositivos con sesión; responde `offline` y `unknown` según el §9.3.
-- Reenvía a otros nodos exactamente una vez y autentica las peticiones entre nodos (§9.4).
+- Reenvía a otros nodos exactamente una vez, solo a nodos verificados en direcciones públicas, autentica las peticiones entre nodos, las acepta solo de los homes de los usuarios por los que hablan y responde `unavailable` cuando no puede contactar con el otro nodo (§9.4).
 - Almacena y procesa las vigilancias según el §12.
 - Opera STUN (§11.2).
 - Aplica los límites del §15.
@@ -1168,6 +1204,7 @@ Lo que una implementación DEBE cumplir, según su papel, para llamarse 7KSP/1. 
 
 ## Historial
 
+- **0.6 (borrador, sin publicar)** — Contacto entre nodos completado: `domain` junto a cada `uid` que un nodo tiene que resolver (`auth`, `resolve`, `watch`, los dos extremos del sobre, el objeto de vigilancia); la autenticación entre nodos vincula al llamante con los usuarios por los que habla y la petición con el receptor (`url` en `Authorization`, `host` en el objeto firmado, memoria de repeticiones); reenvío solo a nodos verificados en direcciones públicas; `homes` comprobados al escribir; error `unavailable`; cachés, tiempos y cortacircuitos del nodo; convención de nombres de la federación pública (Anexo A).
 - **0.5** — Reescritura para el máximo detalle y claridad: glosario, niveles de conformidad por papel, el recorrido de una conexión, algoritmos de validación y resolución en pseudocódigo, sealed box especificada, máquina de estados de la sesión, varios dispositivos, semántica exacta de `connect`, renovación y recuperación de la cuenta, explicación paso a paso del NAT, sección de móviles, ejemplos entre dominios y de entrega diferida, lista de comprobación de conformidad. Sin cambios en el formato de red respecto a la 0.4, salvo: `bye` lleva `reason`; `revoke` lleva `type`; subprotocolo WebSocket `7ksp.v1`; nonce del AEAD definido explícitamente.
 - **0.4** — Dos perfiles de transporte bajo un mismo protocolo: `noise` (nativo) y `webrtc` (navegadores y nativos que quieran hablar con ellos), negociados por sesión con `transports` en las entradas de dispositivo y en `offer`/`answer`; garantías idénticas, ambos sin autoridades de certificación; primitivas de aplicación asignadas a cada perfil; los clientes web vuelven al alcance como clientes solo `webrtc`.
 - **0.3** — Canal directo redefinido: solo UDP; handshake `Noise_IK` con las claves `dev_dh` de los dispositivos en lugar de TLS/DTLS; sin certificados ni SDP; requisitos completos de ICE; formato de paquetes y primitivas; streams fiables en el Anexo C; `endpoints`; `stun` y `roles.relay` en los registros de nodo.
