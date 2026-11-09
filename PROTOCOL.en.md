@@ -510,6 +510,7 @@ Device                                          Verifier                        
 5. The user opens the link, sees the number and presses Accept (§8.8). Meanwhile the device waits with `GET /verify/<req_id>`. The server MAY hold the response for up to 30 s (long-poll); it answers `202` if not yet, `200 {proof}` once the user has accepted, `410` if it expired or was cancelled from the link.
 6. The device builds its device entry with the `proof`, signs it and publishes it with `PUT /record` (§9.2) on the responsible node: the domain node, or one of the shard nodes of the prefix (which replicates it to the others).
 7. The device opens a session on its home (§9.3). It is now online.
+8. A client SHOULD then offer to import the user's history, contacts and preferences from another device of the same address, or from an export the user holds, before starting empty. How that import works is the application's business (the 7ks client uses `7ks-sync/1`, a document of its own); the protocol only guarantees that two devices of one address can open a direct channel like any other pair (§10.4).
 
 Rules on identifiers:
 
@@ -800,6 +801,8 @@ A body that fails validation is never answered. Because the body is signed by `d
 
 An `offer` addressed to a user with several devices is sent **once per device**, each envelope sealed for the corresponding `dev_dh` and with the same `sid`. When the first `answer` arrives, the initiator MUST send `bye answered_elsewhere` to the others and discard their later answers. A receiver that gets `bye` stops ringing.
 
+A device MAY open a session with another device of its own address (same `uid`, different `dev`); the node treats it like any other session and MUST NOT distinguish it.
+
 ### 10.5 Session state machine
 
 ```
@@ -1086,7 +1089,7 @@ A `429` SHOULD carry the `Retry-After` header (RFC 9110 §10.2.3) with the secon
 
 **No certificate authority between devices.** Both profiles authenticate with keys the directory already vouched for: directly in `noise`, through a fingerprint carried in signed signaling in `webrtc`. The only signatures in the system are on directory objects and on signaling, both verified once and cached. There is no authority to trust, to compromise or to pay.
 
-**What a node sees.** The origin and target `uid` of every envelope passing through it, the watches, and which devices have an open session. It sees no signaling or application content, nor can it alter them. A relay sees encrypted packets and their addresses, nothing more. Whoever does not want a third party to see even that runs a domain node.
+**What a node sees.** The origin and target `uid` of every envelope passing through it, the watches, and which devices have an open session. When two devices of one address talk to each other (§10.4), the node sees envelopes with the same `uid` on both ends, and nothing else. It sees no signaling or application content, nor can it alter them. A relay sees encrypted packets and their addresses, nothing more. Whoever does not want a third party to see even that runs a domain node.
 
 **What a malicious node can do.** Deny service to its users, falsely answer `offline` or `unknown`, hold envelopes or refuse to relay. It cannot read, modify or impersonate, because everything is signed or encrypted with keys that never leave the devices.
 
@@ -1122,6 +1125,7 @@ A `429` SHOULD carry the `Retry-After` header (RFC 9110 §10.2.3) with the secon
 | Noise prologue | `7ksp/1` |
 | URI scheme | `7ks:` — `7ks:alice@example.com`, `7ks:alice@example.com?app=7ks-call/1`, `7ks:verify?token=…` |
 | Application names | `name/version`, lowercase, no spaces; `7ks-` reserved for the 7ks client's applications |
+| 7ks client applications | `7ks-chat/1`, `7ks-file/1`, `7ks-call/1`, `7ks-sync/1` (own-device sync, 7ks document); `7ks-archive/1` is the 7ks export container, not a channel application |
 
 ---
 
@@ -1266,7 +1270,7 @@ What an implementation MUST satisfy, per role, to call itself 7KSP/1. Each item 
 
 ## History
 
-- **0.6 (draft, unreleased)** — Contact between nodes completed: `domain` beside every `uid` a node has to resolve (`auth`, `resolve`, `watch`, the two ends of the envelope, the watch object); node-to-node authentication binds the caller to the users it speaks for and the request to the receiver (`url` in `Authorization`, `host` in the signed object, replay memory); forwarding only to verified nodes on public addresses; `homes` checked on write; `unavailable` error; node caches, timeouts and circuit breaker; naming convention of the public federation (Annex A); number match on the login link: `lang` and `code`, a confirmation page that changes nothing on `GET` and accepts or cancels on `POST`, the `cancelled` state (§8.8); optional proof of work on the verification request, with test vectors (§8.9); `Retry-After` on `429` (§14).
+- **0.6 (draft, unreleased)** — Contact between nodes completed: `domain` beside every `uid` a node has to resolve (`auth`, `resolve`, `watch`, the two ends of the envelope, the watch object); node-to-node authentication binds the caller to the users it speaks for and the request to the receiver (`url` in `Authorization`, `host` in the signed object, replay memory); forwarding only to verified nodes on public addresses; `homes` checked on write; `unavailable` error; node caches, timeouts and circuit breaker; naming convention of the public federation (Annex A); number match on the login link: `lang` and `code`, a confirmation page that changes nothing on `GET` and accepts or cancels on `POST`, the `cancelled` state (§8.8); optional proof of work on the verification request, with test vectors (§8.9); `Retry-After` on `429` (§14). Own devices: §8.1 step 8 (import from another device or an export), §10.4 (a device may open a session with another device of its own address), §16 (what the node sees of it), §17 (`7ks-sync/1`, `7ks-archive/1`).
 - **0.5** — Rewrite for maximum detail and clarity: glossary, conformance levels per role, the journey of a connection, validation and resolution algorithms in pseudocode, sealed box specified, session state machine, several devices, exact semantics of `connect`, renewal and account recovery, step-by-step NAT explanation, mobile section, cross-domain and deferred-delivery examples, conformance checklist. No wire-format changes relative to 0.4 except: `bye` carries `reason`; `revoke` carries `type`; WebSocket subprotocol `7ksp.v1`; AEAD nonce defined explicitly.
 - **0.4** — Two transport profiles under one protocol: `noise` (native) and `webrtc` (browsers and natives wanting to reach them), negotiated per session with `transports` in device entries and in `offer`/`answer`; identical guarantees, both without certificate authorities; application primitives mapped to each profile; web clients back in scope as `webrtc`-only clients.
 - **0.3** — Direct channel redefined: UDP only; `Noise_IK` handshake with the devices' `dev_dh` keys instead of TLS/DTLS; no certificates or SDP; full ICE requirements; packet format and primitives; reliable streams in Annex C; `endpoints`; `stun` and `roles.relay` in node records.

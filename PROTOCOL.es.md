@@ -510,6 +510,7 @@ Dispositivo                                     Verificador                     
 5. El usuario abre el enlace, ve el número y pulsa Aceptar (§8.8). Mientras tanto, el dispositivo espera con `GET /verify/<req_id>`. El servidor PUEDE retener la respuesta hasta 30 s (long-poll); responde `202` si todavía no, `200 {proof}` cuando el usuario ha aceptado y `410` si caducó o se canceló desde el enlace.
 6. El dispositivo construye su entrada de dispositivo con la `proof`, la firma y la publica con `PUT /record` (§9.2) en el nodo responsable: el nodo de dominio, o uno de los nodos de shard del prefijo (que la replica a los demás).
 7. El dispositivo abre una sesión en su home (§9.3). Ya está en línea.
+8. Un cliente DEBERÍA ofrecer entonces importar el historial, los contactos y las preferencias del usuario desde otro dispositivo de la misma dirección, o desde una exportación que el usuario conserve, antes de empezar vacío. Cómo funciona esa importación es asunto de la aplicación (el cliente 7ks usa `7ks-sync/1`, un documento propio); el protocolo solo garantiza que dos dispositivos de una dirección pueden abrir un canal directo como cualquier otro par (§10.4).
 
 Reglas sobre los identificadores:
 
@@ -800,6 +801,8 @@ Un cuerpo que no supera la validación nunca se responde. Como el cuerpo va firm
 
 Una `offer` dirigida a un usuario con varios dispositivos se envía **una vez por dispositivo**, cada sobre sellado para el `dev_dh` correspondiente y con el mismo `sid`. Cuando llega la primera `answer`, el iniciador DEBE enviar `bye answered_elsewhere` a los demás y descartar sus respuestas posteriores. Un receptor que recibe `bye` deja de sonar.
 
+Un dispositivo PUEDE abrir una sesión con otro dispositivo de su propia dirección (mismo `uid`, distinto `dev`); el nodo la trata como cualquier otra sesión y NO DEBE distinguirla.
+
 ### 10.5 Máquina de estados de la sesión
 
 ```
@@ -1086,7 +1089,7 @@ Un `429` DEBERÍA llevar la cabecera `Retry-After` (RFC 9110 §10.2.3) con los s
 
 **Sin autoridad de certificación entre dispositivos.** Los dos perfiles autentican con claves que el directorio ya avaló: directamente en `noise`, mediante una huella transportada en señalización firmada en `webrtc`. Las únicas firmas del sistema están en los objetos del directorio y en la señalización, ambas verificadas una vez y cacheadas. No hay ninguna autoridad en la que confiar, que comprometer o a la que pagar.
 
-**Qué ve un nodo.** El `uid` de origen y de destino de cada sobre que pasa por él, las vigilancias y qué dispositivos tienen sesión abierta. No ve el contenido de la señalización ni de la aplicación, ni puede alterarlos. Un relay ve paquetes cifrados y sus direcciones, nada más. Quien no quiera que un tercero vea ni siquiera eso, opera un nodo de dominio.
+**Qué ve un nodo.** El `uid` de origen y de destino de cada sobre que pasa por él, las vigilancias y qué dispositivos tienen sesión abierta. Cuando dos dispositivos de una dirección hablan entre sí (§10.4), el nodo ve sobres con el mismo `uid` en ambos extremos, y nada más. No ve el contenido de la señalización ni de la aplicación, ni puede alterarlos. Un relay ve paquetes cifrados y sus direcciones, nada más. Quien no quiera que un tercero vea ni siquiera eso, opera un nodo de dominio.
 
 **Qué puede hacer un nodo malicioso.** Denegar el servicio a sus usuarios, responder falsamente `offline` o `unknown`, retener sobres o negarse a hacer de relay. No puede leer, modificar ni suplantar, porque todo va firmado o cifrado con claves que nunca salen de los dispositivos.
 
@@ -1122,6 +1125,7 @@ Un `429` DEBERÍA llevar la cabecera `Retry-After` (RFC 9110 §10.2.3) con los s
 | Prólogo Noise | `7ksp/1` |
 | Esquema URI | `7ks:` — `7ks:alice@example.com`, `7ks:alice@example.com?app=7ks-call/1`, `7ks:verify?token=…` |
 | Nombres de aplicación | `nombre/versión`, en minúsculas, sin espacios; `7ks-` reservado para las aplicaciones del cliente 7ks |
+| Aplicaciones del cliente 7ks | `7ks-chat/1`, `7ks-file/1`, `7ks-call/1`, `7ks-sync/1` (sincronización entre dispositivos propios, documento 7ks); `7ks-archive/1` es el contenedor de exportación de 7ks, no una aplicación de canal |
 
 ---
 
@@ -1266,7 +1270,7 @@ Lo que una implementación DEBE cumplir, según su papel, para llamarse 7KSP/1. 
 
 ## Historial
 
-- **0.6 (borrador, sin publicar)** — Contacto entre nodos completado: `domain` junto a cada `uid` que un nodo tiene que resolver (`auth`, `resolve`, `watch`, los dos extremos del sobre, el objeto de vigilancia); la autenticación entre nodos vincula al llamante con los usuarios por los que habla y la petición con el receptor (`url` en `Authorization`, `host` en el objeto firmado, memoria de repeticiones); reenvío solo a nodos verificados en direcciones públicas; `homes` comprobados al escribir; error `unavailable`; cachés, tiempos y cortacircuitos del nodo; convención de nombres de la federación pública (Anexo A); coincidencia de número en el enlace de alta: `lang` y `code`, una página de confirmación que no cambia nada con `GET` y acepta o cancela con `POST`, el estado `cancelled` (§8.8); prueba de trabajo opcional en la petición de verificación, con vectores de prueba (§8.9); `Retry-After` en `429` (§14).
+- **0.6 (borrador, sin publicar)** — Contacto entre nodos completado: `domain` junto a cada `uid` que un nodo tiene que resolver (`auth`, `resolve`, `watch`, los dos extremos del sobre, el objeto de vigilancia); la autenticación entre nodos vincula al llamante con los usuarios por los que habla y la petición con el receptor (`url` en `Authorization`, `host` en el objeto firmado, memoria de repeticiones); reenvío solo a nodos verificados en direcciones públicas; `homes` comprobados al escribir; error `unavailable`; cachés, tiempos y cortacircuitos del nodo; convención de nombres de la federación pública (Anexo A); coincidencia de número en el enlace de alta: `lang` y `code`, una página de confirmación que no cambia nada con `GET` y acepta o cancela con `POST`, el estado `cancelled` (§8.8); prueba de trabajo opcional en la petición de verificación, con vectores de prueba (§8.9); `Retry-After` en `429` (§14). Dispositivos propios: §8.1 paso 8 (importar desde otro dispositivo o una exportación), §10.4 (un dispositivo puede abrir sesión con otro de su propia dirección), §16 (qué ve el nodo de ello), §17 (`7ks-sync/1`, `7ks-archive/1`).
 - **0.5** — Reescritura para el máximo detalle y claridad: glosario, niveles de conformidad por papel, el recorrido de una conexión, algoritmos de validación y resolución en pseudocódigo, sealed box especificada, máquina de estados de la sesión, varios dispositivos, semántica exacta de `connect`, renovación y recuperación de la cuenta, explicación paso a paso del NAT, sección de móviles, ejemplos entre dominios y de entrega diferida, lista de comprobación de conformidad. Sin cambios en el formato de red respecto a la 0.4, salvo: `bye` lleva `reason`; `revoke` lleva `type`; subprotocolo WebSocket `7ksp.v1`; nonce del AEAD definido explícitamente.
 - **0.4** — Dos perfiles de transporte bajo un mismo protocolo: `noise` (nativo) y `webrtc` (navegadores y nativos que quieran hablar con ellos), negociados por sesión con `transports` en las entradas de dispositivo y en `offer`/`answer`; garantías idénticas, ambos sin autoridades de certificación; primitivas de aplicación asignadas a cada perfil; los clientes web vuelven al alcance como clientes solo `webrtc`.
 - **0.3** — Canal directo redefinido: solo UDP; handshake `Noise_IK` con las claves `dev_dh` de los dispositivos en lugar de TLS/DTLS; sin certificados ni SDP; requisitos completos de ICE; formato de paquetes y primitivas; streams fiables en el Anexo C; `endpoints`; `stun` y `roles.relay` en los registros de nodo.
