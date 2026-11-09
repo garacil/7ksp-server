@@ -1,6 +1,6 @@
 # 7KSP/1 — 7ks Protocol
 
-Protocol version: 1. Document status: draft 0.6 (draft, unreleased).
+Protocol version: 1. Document status: draft 0.7 (draft, unreleased).
 
 7KSP is an open and free protocol that, starting from an email address, opens a direct, encrypted, authenticated channel between two devices. This document contains everything needed to implement an interoperable client or node without consulting any other source. It is written so that a complete implementation fits in a few thousand lines in any language, using only standard components: HTTPS and WebSocket towards nodes, JSON, Ed25519, X25519, the Noise framework, STUN, UDP and, where a browser is involved, WebRTC.
 
@@ -115,7 +115,7 @@ It does not define what travels over the channel. Chat, calls, files or any othe
 ### 2.1 Encoding
 
 - All messages and objects exchanged with nodes are JSON (RFC 8259) in UTF-8.
-- Bytes (keys, signatures, hashes) are encoded as **base64url without padding** (RFC 4648 §5): alphabet `A–Z a–z 0–9 - _`, no trailing `=`.
+- Bytes (keys, signatures, hashes) are encoded as **base64url without padding** (RFC 4648 §5): alphabet `A–Z a–z 0–9 - _`, no trailing `=`. A decoder MUST reject any other character, a trailing `=`, an impossible length and non-zero pad bits (RFC 4648 §3.5): every byte string has exactly one accepted encoding, so the same key never appears under two spellings.
 - Times are integers: Unix seconds in UTC.
 - Unknown fields MUST be ignored. Fields defined as mandatory MUST be present; their absence makes the object invalid.
 - Packets of the `noise` profile (§11.4) are binary, with integers in big-endian.
@@ -135,14 +135,14 @@ verify(object, public_key):
     return Ed25519_verify(public_key, JCS(o), base64url_decode(object.sig))
 ```
 
-JCS (JSON Canonicalization Scheme) guarantees that every implementation produces exactly the same bytes to sign without agreeing on a field order or a number format. Implementations exist in all common languages; where there is none, it is a hundred lines.
+JCS (JSON Canonicalization Scheme) guarantees that every implementation produces exactly the same bytes to sign without agreeing on a field order or a number format. Implementations exist in all common languages; where there is none, it is a hundred lines. Numbers in protocol objects are integers. A parser MUST reject the token `-0` (RFC 8785, verified erratum 7920) and non-finite values. `Ed25519_verify` is the verification of RFC 8032 §5.1.7 exactly: a signature whose `S` is not below the group order, or whose `R` or public key does not decode, is invalid.
 
 ### 2.3 Algorithms
 
 | Use | Algorithm | Reference |
 |---|---|---|
 | Signature of objects and signaling | Ed25519 | RFC 8032 |
-| Encryption of signaling to a device | libsodium *sealed box*: ephemeral X25519 + XSalsa20-Poly1305 | `crypto_box_seal` |
+| Encryption of signaling to a device | libsodium *sealed box*: ephemeral X25519, HSalsa20 key derivation, XSalsa20-Poly1305 | `crypto_box_seal` |
 | Identifier hash | SHA-256 | FIPS 180-4 |
 | Transport to nodes | HTTPS and WSS, TLS 1.3, ordinary web certificate of the node | RFC 8446 |
 | Direct channel, `noise` profile | `Noise_IK_25519_ChaChaPoly_BLAKE2s` over UDP | Noise rev. 34 |
@@ -157,12 +157,14 @@ Encrypts a message for an X25519 public key without the sender needing a long-te
 ```
 sealed_box(target_pk, message):
     (epk, esk) = X25519_keypair()                       // ephemeral, discarded afterwards
-    nonce = BLAKE2b-24( epk || target_pk )
-    ct = XSalsa20-Poly1305( key = X25519(esk, target_pk), nonce, message )
+    shared = X25519(esk, target_pk)                     // 32 bytes; an all-zero result fails
+    key = HSalsa20(shared, 16 zero bytes)               // libsodium crypto_box_beforenm
+    nonce = BLAKE2b(epk || target_pk), 24-byte output   // unkeyed, digest length 24; not a longer digest truncated
+    ct = XSalsa20-Poly1305(key, nonce, message)         // libsodium secretbox: 16-byte tag, then the ciphertext
     return epk(32) || ct
 ```
 
-The receiver recomputes the nonce with its own public key and decrypts with `X25519(target_sk, epk)`. This is exactly libsodium's `crypto_box_seal`, available in every language; an implementation SHOULD use the library rather than reimplement it.
+The receiver recomputes the nonce with the ephemeral key exactly as received and its own public key, derives the same key from `X25519(target_sk, epk)` through HSalsa20, and opens the box; an all-zero X25519 output MUST fail, as it does in libsodium. The raw X25519 output is **not** the key: drafts up to 0.6 omitted the HSalsa20 step in this pseudocode, and a box built that way does not open in libsodium. This is exactly libsodium's `crypto_box_seal` (48 bytes of overhead), available in every language; an implementation SHOULD use the library rather than reimplement it. A device whose private key cannot leave a platform key store takes the X25519 output from the store's key agreement and applies the HSalsa20 and secretbox steps itself. Opening a sealed box authenticates nothing about the sender: the signature inside the body (§10.2) does.
 
 ---
 
@@ -525,7 +527,10 @@ The verifier SHOULD send an email, in the language of the request, containing: t
 
 - Send the link only to the indicated address, never to another.
 - Issue the proof only after the user accepted on the confirmation page (§8.8); opening the link alone MUST NOT issue it.
-- Rate-limit: SHOULD reject more than 5 requests per address per hour (`429` with `Retry-After`), apply limits per network origin, and MAY require a proof of work (§8.9).
+- Rate-limit, counting each limit on its own so that a short window never erases a longer one: MUST reject more than 5 requests per address per hour and SHOULD reject more than 12 per address per day (`429` with the real `Retry-After`, §14); apply limits per network origin and a global ceiling; bound the issuing of challenges per origin; and MAY require a proof of work (§8.9), raising its difficulty under load.
+- Build the links of the email only from its own configured names, never from the `Host` of the request (§9), and send nothing for a request that reached it under another name.
+- Keep the confirmation token only as a hash, never write a link or a token to a log, and delete the request and any stored copy of the mail when the token expires.
+- Send the mail with a return path whose bounces no person reads: a bounce carries the link.
 - Not keep the email in clear after issuing the proof; keep only `uid`.
 - Sign `iat` with its own clock; `exp = iat + 30 days` at most.
 
@@ -541,7 +546,7 @@ Body:
 { "type": "revoke", "uid": "<uid>", "dev_pk": "<dev_pk to remove>", "by": "<signing key>", "iat": 1762560000, "sig": "<…>" }
 ```
 
-`sig` MUST be from one of these keys: another current device of the same `uid` (`by` = its `dev_pk`), an accepted verifier after a new link (`by` = `verifier_pk`), or the domain (`by` = `dom_pk`). `iat` MUST be within 5 minutes of the node's clock. The node MUST delete the entry, propagate it to its replicas and notify `record_changed` (§9.3) to connected clients subscribed to that `uid`.
+`sig` MUST be from one of these keys: another current device of the same `uid` (`by` = its `dev_pk`), an accepted verifier after a new link (`by` = `verifier_pk`), or the domain (`by` = `dom_pk`). `iat` MUST be within 5 minutes of the node's clock. The node MUST delete the entry, propagate it to its replicas and notify `record_changed` (§9.3) to connected clients subscribed to that `uid`. A revocation takes effect at once: the node MUST close every session of the revoked device (§9.3), and MUST refuse a later entry for that `dev_pk` whose `proof.iat` is not later than the `iat` of the revocation, until that proof would have expired; a revoked key returns only with a proof issued after the revocation. Replicas apply the same rule.
 
 ### 8.6 Recovery
 
@@ -573,7 +578,7 @@ A verifier sends mail on behalf of whoever asks, so it is a target for mass sign
 2. **Puzzle.**
 
 ```
-preimage = nonce ":" email_normalized ":" counter        (ASCII bytes, no spaces)
+preimage = nonce ":" email_normalized ":" counter        (UTF-8 bytes, no spaces)
 valid    = leading_zero_bits( SHA-256(preimage) ) >= difficulty
 ```
 
@@ -601,7 +606,7 @@ Negative checks: the counter `0124804` is malformed (leading zero); V3a's counte
 
 ## 9. Node API
 
-The whole API lives under `<url>/7ks/v1/`. Read routes are unauthenticated HTTPS; write routes carry signed objects; the device session is a WebSocket. Nodes use HTTPS because they are ordinary servers with names and certificates; devices never use it among themselves.
+The whole API lives under `<url>/7ks/v1/`. Read routes are unauthenticated HTTPS; write routes carry signed objects; the device session is a WebSocket. Nodes use HTTPS because they are ordinary servers with names and certificates; devices never use it among themselves. A node MUST answer only under its own names (the host of its `url` and, in the public federation, its shard names of Annex A): a request whose `Host` is any other name is answered `421` with `{ "error": "invalid", "detail": "host" }`, and no link, hint or record is ever built from a `Host` the node does not own.
 
 ### 9.1 Public reads
 
@@ -628,6 +633,8 @@ These routes MUST NOT require authentication or limit by origin beyond what is r
 
 A node is responsible for a `uid` if: it is the domain node of that domain, or it is a shard node of the prefix and the domain has no DNS entry. In any other case it answers `403` with `{ "error": "not_responsible", "responsible": ["<url>", "…"] }` if it knows. `PUT` and `DELETE` need no session: the object carries its own authority. A node MUST reject (`invalid`) an entry whose `homes` contain a URL that is not `https` or whose host does not pass the address rule of §9.4, and SHOULD also require a valid node record at each of them (§9.4), because other nodes will forward to those URLs.
 
+A node MAY cap the current devices of an address below the limit of §15 (the 7ks nodes allow 10). An entry that would exceed the cap is answered `429` with `{ "error": "limit", "detail": "<n> devices" }` and **no** `Retry-After`: it is a quota, not a rate, and waiting does not clear it. Only current entries count; expired ones do not. Malformed keys or encodings in any write are `400 invalid`, never a server error.
+
 ### 9.3 Device session (WebSocket)
 
 A device connected to a node opens `wss://<host of url>/7ks/v1/session` with the subprotocol `Sec-WebSocket-Protocol: 7ksp.v1`. While the session is open, the device is **online** on that node. Closing it is disconnecting. There is no other presence mechanism.
@@ -653,6 +660,7 @@ All messages are JSON objects with `t` (type). Requests carry `id` (a string cho
 ```
 
 - The node MUST check that `dev_pk` has a current entry for `uid`: in its own directory if responsible; by resolving (§7) if not. A node MAY accept as home devices of any domain; it need not be responsible for their directory.
+- The session lasts only while that entry is current. The node MUST check it again when it handles each message from the device, and MUST close the session, after `{ "t": "error", "code": "unauthorized" }`, as soon as the entry is revoked (§8.5) or expires. A node SHOULD bound what one device may hold: frames of at most 64 KiB, at most 256 subscribed `uid`s and a small number of simultaneous sessions per device (the 7ks nodes allow 4); beyond that it answers `limit`.
 - `domain` is the domain of the device's address. It is not signed: a node that serves that domain's directory ignores it; any other node needs it to resolve (§7), and a wrong value makes the resolution fail and the session `unauthorized`.
 - `host` prevents a signature from being valid on another node. `nonce` prevents replay.
 - `push` is optional (§13). A desktop device does not send it.
@@ -817,6 +825,8 @@ Receiver
 
 In CONNECTED, signaling through the node is only used if the direct channel is lost and must be renegotiated (§11.8); the closing `bye` MAY go over the direct channel or through the node.
 
+**Crossed offers.** When a device receives an `offer` from a device to which it has itself sent an `offer` that is still unanswered, for the same application, both are in OFFERED and one must yield. The device whose `uid` followed by `dev_pk` (the two base64url strings concatenated, compared byte by byte) is the **smaller** keeps its own offer and answers the other with `reject` and reason `busy`; the other discards its own offer without sending `bye` and answers the offer it received. From then on the yielding side MUST NOT send anything for the session it abandoned: an offer, answer or candidate produced later by work that was already in flight is dropped.
+
 ### 10.6 Timers
 
 | Event | Value |
@@ -899,8 +909,8 @@ Rules:
 - The handshake initiator is the session initiator (`offer`).
 - The receiver MUST verify that the decrypted static key is a `dev_dh` of the `from.uid` of the offer (the one in the sealed signaling, which the directory confirms). If it is not, it MUST discard the message without answering.
 - The initiator MUST verify that the receiver's message decrypts with the keys derived from the `dev_dh` it expected. A wrong receiver cannot produce it.
-- The payload of `handshake_init` is a 12-byte TAI64N timestamp. The receiver MUST reject a timestamp earlier than the last one accepted from that static key (replay protection) and SHOULD reject one more than 90 s away from its clock.
-- Under load, a receiver MAY ignore `handshake_init` beyond a per-source-address limit; the initiator retransmits every 1 s up to 5 times.
+- The payload of `handshake_init` is a 12-byte TAI64N timestamp. Every `handshake_init` a device sends, retransmissions included, is a new message with a fresh ephemeral key, a fresh `sender_idx` and a timestamp strictly greater than any it sent before to that static key (if its clock stepped back, the previous value plus one nanosecond). The receiver MUST reject a timestamp less than or equal to the last one it accepted from that static key, so that the first message, which Noise leaves replayable (Noise §7.7), is never accepted twice, and SHOULD reject one more than 90 s away from its clock. An accepted newer `handshake_init` from the same static key supersedes the session an earlier one left half open; the superseded session is discarded when the first `data` packet arrives under the new keys, or after 10 s.
+- Under load, a receiver MAY ignore `handshake_init` beyond a per-source-address limit; the initiator sends a new one every 1 s, up to 5 times.
 - Rekey: a new handshake over the same session every 120 s, or after 2⁶⁰ packets, or whenever either side wants. The old keys remain valid for 10 s after the new ones are established.
 
 No certificate, name or signature takes part in the handshake. Authentication is Diffie-Hellman against keys both sides already trust.
@@ -919,8 +929,8 @@ Every packet starts with one type byte. The values are chosen so that a single s
 - `reserved`: three zero bytes. A receiver MUST ignore their value.
 - `sender_idx` / `receiver_idx`: 4 random bytes per session chosen by each side. A receiver finds the session by `receiver_idx` without decrypting; several sessions coexist on one socket.
 - `e`: ephemeral X25519 public key. `enc_s`: encrypted static key (32 + 16-byte tag). `enc_ts`: encrypted timestamp (12 + 16). `enc_empty`: encrypted empty payload (tag only).
-- `counter`: 64 bits, strictly increasing per session key, used as the AEAD nonce (12 bytes: 4 zero bytes + the 8 of the counter). The receiver MUST discard repeated or out-of-window counters (window of 2048 backwards).
-- `AEAD(payload)`: ChaCha20-Poly1305 with the session key and the nonce; the 16-byte tag follows the ciphertext.
+- `counter`: 64 bits, big-endian on the wire like every integer of these packets, strictly increasing per session key and starting at 0 in each direction. It is the nonce `n` of the Noise transport CipherState, carried explicitly because packets may be lost or reordered (Noise §11.4): a `data` packet is `EncryptWithAd(empty, payload)` under the CipherState of its direction after `SetNonce(counter)`. The 12-byte AEAD nonce is therefore the one of Noise §12.3, 4 zero bytes followed by the counter in **little-endian**, for transport packets exactly as for the handshake; only the 8 bytes on the wire are big-endian. The initiator sends with the first CipherState `Split()` returns and receives with the second. A session key MUST NOT encrypt two packets with the same counter. The receiver keeps the highest counter it accepted and a window of exactly 2048 positions including it: a higher counter is accepted and becomes the highest; a lower one not seen before is accepted only when `highest - counter < 2048`; anything else is discarded. The window is updated only after the tag verifies.
+- `AEAD(payload)`: ChaCha20-Poly1305 (RFC 8439) with the session key, that nonce and **empty associated data**; the 16-byte tag follows the ciphertext. The clear header is not authenticated as associated data: the counter is bound through the nonce, `receiver_idx` only selects the session, and `reserved` is ignored.
 - Maximum payload: 1200 bytes, to avoid IP fragmentation on any path (maximum packet 1232 bytes, below the IPv6 minimum MTU). Larger application data is split by the stream layer.
 
 #### Primitives on the wire
@@ -1046,7 +1056,7 @@ HTTP responses use standard codes and a body `{ "error": "<code>", "detail": "<f
 | `unauthorized` | 401 | Invalid session or node authentication |
 | `unavailable` | 503 | The node responsible for the target could not be reached or did not answer in time; retry later |
 
-A `429` SHOULD carry the `Retry-After` header (RFC 9110 §10.2.3) with the seconds to wait. `detail` MAY name the cause; the values with a defined meaning are `challenge` and `pow` (§8.9) and `cancelled` (§8.8).
+A `429` for a rate MUST carry the `Retry-After` header (RFC 9110 §10.2.3) with the real number of seconds until the request can succeed, never a constant; a `429` for a quota that waiting does not clear (the device cap of §9.2) carries none. `detail` MAY name the cause; the values with a defined meaning are `challenge`, `pow` and `rate` (§8.9, §8.3), `cancelled` (§8.8), `host` (§9), `keys` (malformed keys in a verification request) and `<n> devices` (§9.2). A request under a name the node does not own is `421` with `invalid` and detail `host` (§9). An input the client got wrong is always a `4xx`; a node MUST NOT answer it with a server error.
 
 ---
 
@@ -1056,21 +1066,23 @@ A `429` SHOULD carry the `Retry-After` header (RFC 9110 §10.2.3) with the secon
 |---|---|
 | Envelope: maximum `exp` / size | 120 s / 16 KB |
 | Device entry: maximum `exp` | 30 days; renew at 20 |
-| Devices per `uid` | 32 |
+| Devices per `uid` | 32; a node MAY cap lower (§9.2; the 7ks nodes: 10) |
 | `homes` / `endpoints` per entry | 4 / 4 |
 | Verification token | 15 minutes |
-| Verification requests | 5 per address per hour |
+| Verification requests | 5 per address per hour and 12 per day; challenges bounded per origin (§8.3) |
 | Watches per watcher / `ttl` | 256 / 7 days |
 | Relay credentials | 1 hour |
 | Relay per session | operator's quota; recommended 1 Mbit/s and 10 minutes |
 | WebSocket session ping | 30 s; the node closes after 90 s without traffic |
+| Session: frame / subscriptions / sessions per device | 64 KiB / 256 / node's choice (the 7ks nodes: 4) |
 | Shard table: `exp` | 7 days |
 | Direct `endpoints` attempt | 3 s |
 | ICE probes: interval / total | 50–200 ms / 30 s |
 | `prange.count` | ≤ 20 |
 | Channel keepalive | 15–25 s; dead after 3 missed |
-| Handshake retransmission (`noise`) | 1 s, 5 attempts |
+| Handshake retransmission (`noise`) | a new `handshake_init` every 1 s, 5 attempts |
 | Rekey (`noise`) | 120 s or 2⁶⁰ packets |
+| Replay window (`noise`) | 2048 counters including the highest accepted |
 | Packet payload (`noise`) | ≤ 1200 bytes |
 | Envelope duplicate memory | 5 minutes |
 | Node-to-node request: connection / total | 5 s / 10 s |
@@ -1099,9 +1111,19 @@ A `429` SHOULD carry the `Retry-After` header (RFC 9110 §10.2.3) with the secon
 
 **Enumeration.** The `uid` is an unsalted hash, so whoever has a list of email addresses can check which ones are in the public directory. This is accepted: the directory returns no emails, only keys, and domains with their own node do not appear in it.
 
-**Mass sign-up and mail flooding.** The verifier is the only part of the protocol that acts on behalf of a stranger, by sending mail. The proof of work (§8.9) makes every request cost the requester, the limits per address and per network (§8.3) bound what remains, and no third-party captcha is involved, so no request data leaves the verifier.
+**Mass sign-up and mail flooding.** The verifier is the only part of the protocol that acts on behalf of a stranger, by sending mail. The proof of work (§8.9) makes every request cost the requester, the limits per address and per network (§8.3) bound what remains, and no third-party captcha is involved, so no request data leaves the verifier. The limits are counted independently of one another, an address never receives more than 12 mails a day, and a refused request is told the real wait (§8.3, §14).
 
 **A link opened by the wrong person.** Opening a link signs nobody in (§8.8): a link scanner or a curious recipient changes nothing, and a user who sees a number that their device does not show cancels the request.
+
+**Links under a foreign name.** A verifier that built its links from the `Host` of the request would mail, in its own name, a link to whatever origin the requester chose; the victim who opens it hands the token to that origin. Links come only from the node's configured names, and a request under any other name is refused (§8.3, §9).
+
+**Revocation that does not bite.** Removing a device is the user's answer to a lost or stolen device, so it has to be immediate and final: the node closes the device's sessions and refuses its old proof (§8.5, §9.3). Without both rules the holder of the revoked key stays online, or signs a higher `seq` with the proof it already had and reappears.
+
+**Bounces.** The verification mail contains the link. A bounce returns that mail to the envelope sender; the verifier therefore uses a return path that no person reads, and treats a mailbox of bounces as it treats tokens (§8.3).
+
+**Sealed box and key stores.** The sealed box is libsodium's construction to the byte (§2.4), including the HSalsa20 step and the failure on an all-zero agreement. It hides the content from the node and authenticates nothing: the signature inside the body and the directory checks of §10.2 decide who is speaking.
+
+**Replay on the direct channel.** The first handshake message of `Noise_IK` carries no contribution of the receiver and could be replayed; the strictly increasing timestamp removes that (§11.4). Data packets are protected by the counter and its window, and a counter never repeats under one key.
 
 **Open forwarding.** A node forwards only to URLs that resolution produced and that prove to be nodes (§9.4), never to a URL a client or an entry names on its own, and it accepts forwarded requests only from nodes that are homes of the users they speak for. Without the first rule a node would be a proxy towards arbitrary hosts, including its own private network; without the second, anyone able to run a node could flood any other node in the name of invented users, and `online` notices would become a push-spam channel.
 
@@ -1246,6 +1268,8 @@ What an implementation MUST satisfy, per role, to call itself 7KSP/1. Each item 
 - Retries pending work on startup and on network recovery, and uses watches (§12).
 - Sends `domain` with `auth`, `resolve` and `watch` and in both ends of every envelope (§9.3, §10.1), and never the address itself outside the sealed body.
 - Solves the verifier's proof of work when asked (§8.9) and shows the number of the request until the proof arrives (§8.8).
+- Rejects non-canonical base64url, the JSON token `-0` and the signatures RFC 8032 rejects (§2.1, §2.2), and builds sealed boxes exactly as §2.4.
+- Resolves crossed offers by the rule of §10.5 and sends nothing for a session it abandoned.
 
 **Native client, additionally**: full `noise` profile (§11.4, Annex C), `endpoints` if any (§11.7), mobile behaviour (§11.10).
 **Web client, additionally**: `webrtc` profile (§11.5), announcing only that profile.
@@ -1253,6 +1277,8 @@ What an implementation MUST satisfy, per role, to call itself 7KSP/1. Each item 
 **Every node**
 - Exposes the read routes without authentication and the write routes with full validation (§9.1, §9.2).
 - Authenticates sessions by challenge and checks the device entry (§9.3).
+- Ends a session when its entry is revoked or expires, and refuses the old proof of a revoked key (§8.5, §9.3).
+- Answers only under its own names (§9), with `4xx` for every client error and the real `Retry-After` on rate limits (§14).
 - Never queues envelopes except the push retention (§10.1, §13).
 - Delivers `connect` only to devices with a session; answers `offline` and `unknown` per §9.3.
 - Forwards to other nodes exactly once, only to verified nodes on public addresses, authenticates node-to-node requests, accepts them only from the homes of the users they speak for, and answers `unavailable` when the other node cannot be reached (§9.4).
@@ -1270,7 +1296,9 @@ What an implementation MUST satisfy, per role, to call itself 7KSP/1. Each item 
 
 ## History
 
-- **0.6 (draft, unreleased)** — Contact between nodes completed: `domain` beside every `uid` a node has to resolve (`auth`, `resolve`, `watch`, the two ends of the envelope, the watch object); node-to-node authentication binds the caller to the users it speaks for and the request to the receiver (`url` in `Authorization`, `host` in the signed object, replay memory); forwarding only to verified nodes on public addresses; `homes` checked on write; `unavailable` error; node caches, timeouts and circuit breaker; naming convention of the public federation (Annex A); number match on the login link: `lang` and `code`, a confirmation page that changes nothing on `GET` and accepts or cancels on `POST`, the `cancelled` state (§8.8); optional proof of work on the verification request, with test vectors (§8.9); `Retry-After` on `429` (§14). Own devices: §8.1 step 8 (import from another device or an export), §10.4 (a device may open a session with another device of its own address), §16 (what the node sees of it), §17 (`7ks-sync/1`, `7ks-archive/1`).
+- **0.7 (draft, unreleased)** — Security review of 2026-11-09: the lead's own audit, the audit of the API team and the review of the mobile team, against Noise rev. 34, RFC 8032, RFC 8439, RFC 4648, RFC 8785 with erratum 7920, RFC 5321 and libsodium. Correction: the sealed box pseudocode omitted the HSalsa20 key derivation of `crypto_box_seal` (§2.4). The `noise` profile made exact (§11.4): counters start at 0, the AEAD nonce is the Noise one (little-endian) while the counter on the wire is big-endian, empty associated data, the replay window to the position, and every `handshake_init` is a new message with a strictly greater timestamp. New rules: canonical base64url, `-0` rejected, RFC 8032 verification (§2.1, §2.2); verifier limits counted independently with a daily cap, links only from the node's own names, tokens hashed and never logged, bounces (§8.3); a revocation closes sessions and refuses the old proof (§8.5, §9.3); a node answers only under its own names, `421` otherwise (§9); the device cap answer and session bounds (§9.2, §9.3, §15); crossed offers (§10.5); the real `Retry-After` and no server error for a client error (§14); the proof-of-work preimage is UTF-8 bytes (§8.9); five paragraphs added to §16.
+
+- **0.6** — Contact between nodes completed: `domain` beside every `uid` a node has to resolve (`auth`, `resolve`, `watch`, the two ends of the envelope, the watch object); node-to-node authentication binds the caller to the users it speaks for and the request to the receiver (`url` in `Authorization`, `host` in the signed object, replay memory); forwarding only to verified nodes on public addresses; `homes` checked on write; `unavailable` error; node caches, timeouts and circuit breaker; naming convention of the public federation (Annex A); number match on the login link: `lang` and `code`, a confirmation page that changes nothing on `GET` and accepts or cancels on `POST`, the `cancelled` state (§8.8); optional proof of work on the verification request, with test vectors (§8.9); `Retry-After` on `429` (§14). Own devices: §8.1 step 8 (import from another device or an export), §10.4 (a device may open a session with another device of its own address), §16 (what the node sees of it), §17 (`7ks-sync/1`, `7ks-archive/1`).
 - **0.5** — Rewrite for maximum detail and clarity: glossary, conformance levels per role, the journey of a connection, validation and resolution algorithms in pseudocode, sealed box specified, session state machine, several devices, exact semantics of `connect`, renewal and account recovery, step-by-step NAT explanation, mobile section, cross-domain and deferred-delivery examples, conformance checklist. No wire-format changes relative to 0.4 except: `bye` carries `reason`; `revoke` carries `type`; WebSocket subprotocol `7ksp.v1`; AEAD nonce defined explicitly.
 - **0.4** — Two transport profiles under one protocol: `noise` (native) and `webrtc` (browsers and natives wanting to reach them), negotiated per session with `transports` in device entries and in `offer`/`answer`; identical guarantees, both without certificate authorities; application primitives mapped to each profile; web clients back in scope as `webrtc`-only clients.
 - **0.3** — Direct channel redefined: UDP only; `Noise_IK` handshake with the devices' `dev_dh` keys instead of TLS/DTLS; no certificates or SDP; full ICE requirements; packet format and primitives; reliable streams in Annex C; `endpoints`; `stun` and `roles.relay` in node records.

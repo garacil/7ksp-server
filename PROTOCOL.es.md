@@ -1,6 +1,6 @@
 # 7KSP/1 — Protocolo 7ks
 
-Versión del protocolo: 1. Estado del documento: borrador 0.6 (borrador, sin publicar).
+Versión del protocolo: 1. Estado del documento: borrador 0.7 (borrador, sin publicar).
 
 7KSP es un protocolo abierto y libre que, a partir de una dirección de email, abre un canal directo, cifrado y autenticado entre dos dispositivos. Este documento contiene todo lo necesario para implementar un cliente o un nodo interoperable sin consultar ninguna otra fuente. Está escrito para que una implementación completa quepa en unos pocos miles de líneas en cualquier lenguaje, usando solo componentes estándar: HTTPS y WebSocket hacia los nodos, JSON, Ed25519, X25519, el framework Noise, STUN, UDP y, cuando interviene un navegador, WebRTC.
 
@@ -115,7 +115,7 @@ No define qué viaja por el canal. El chat, las llamadas, los ficheros o cualqui
 ### 2.1 Codificación
 
 - Todos los mensajes y objetos que se intercambian con los nodos son JSON (RFC 8259) en UTF-8.
-- Los bytes (claves, firmas, hashes) se codifican en **base64url sin relleno** (RFC 4648 §5): alfabeto `A–Z a–z 0–9 - _`, sin `=` final.
+- Los bytes (claves, firmas, hashes) se codifican en **base64url sin relleno** (RFC 4648 §5): alfabeto `A–Z a–z 0–9 - _`, sin `=` final. Un decodificador DEBE rechazar cualquier otro carácter, un `=` final, una longitud imposible y los bits de relleno distintos de cero (RFC 4648 §3.5): cada cadena de bytes tiene exactamente una codificación aceptada, de modo que una misma clave nunca aparece con dos grafías.
 - Los tiempos son enteros: segundos Unix en UTC.
 - Los campos desconocidos DEBEN ignorarse. Los campos definidos como obligatorios DEBEN estar presentes; su ausencia invalida el objeto.
 - Los paquetes del perfil `noise` (§11.4) son binarios, con enteros en big-endian.
@@ -135,14 +135,14 @@ verify(objeto, clave_publica):
     return Ed25519_verify(clave_publica, JCS(o), base64url_decode(objeto.sig))
 ```
 
-JCS (JSON Canonicalization Scheme) garantiza que todas las implementaciones producen exactamente los mismos bytes a firmar sin acordar un orden de campos ni un formato de números. Hay implementaciones en todos los lenguajes habituales; donde no la hay, son cien líneas.
+JCS (JSON Canonicalization Scheme) garantiza que todas las implementaciones producen exactamente los mismos bytes a firmar sin acordar un orden de campos ni un formato de números. Hay implementaciones en todos los lenguajes habituales; donde no la hay, son cien líneas. Los números de los objetos del protocolo son enteros. Un analizador DEBE rechazar el token `-0` (RFC 8785, errata verificada 7920) y los valores no finitos. `Ed25519_verify` es exactamente la verificación del RFC 8032 §5.1.7: una firma cuya `S` no es menor que el orden del grupo, o cuya `R` o clave pública no se decodifica, no es válida.
 
 ### 2.3 Algoritmos
 
 | Uso | Algoritmo | Referencia |
 |---|---|---|
 | Firma de objetos y señalización | Ed25519 | RFC 8032 |
-| Cifrado de la señalización hacia un dispositivo | *sealed box* de libsodium: X25519 efímero + XSalsa20-Poly1305 | `crypto_box_seal` |
+| Cifrado de la señalización hacia un dispositivo | *sealed box* de libsodium: X25519 efímero, derivación de clave HSalsa20, XSalsa20-Poly1305 | `crypto_box_seal` |
 | Hash de identificadores | SHA-256 | FIPS 180-4 |
 | Transporte hacia los nodos | HTTPS y WSS, TLS 1.3, certificado web ordinario del nodo | RFC 8446 |
 | Canal directo, perfil `noise` | `Noise_IK_25519_ChaChaPoly_BLAKE2s` sobre UDP | Noise rev. 34 |
@@ -157,12 +157,14 @@ Cifra un mensaje para una clave pública X25519 sin que el emisor necesite una c
 ```
 sealed_box(target_pk, mensaje):
     (epk, esk) = X25519_keypair()                       // efímera, se descarta después
-    nonce = BLAKE2b-24( epk || target_pk )
-    ct = XSalsa20-Poly1305( key = X25519(esk, target_pk), nonce, mensaje )
+    shared = X25519(esk, target_pk)                     // 32 bytes; un resultado todo ceros falla
+    key = HSalsa20(shared, 16 bytes a cero)             // crypto_box_beforenm de libsodium
+    nonce = BLAKE2b(epk || target_pk), salida de 24 bytes // sin clave, longitud de resumen 24; no un resumen más largo truncado
+    ct = XSalsa20-Poly1305(key, nonce, mensaje)         // secretbox de libsodium: etiqueta de 16 bytes y después el texto cifrado
     return epk(32) || ct
 ```
 
-El receptor recalcula el nonce con su propia clave pública y descifra con `X25519(target_sk, epk)`. Es exactamente `crypto_box_seal` de libsodium, disponible en todos los lenguajes; una implementación DEBERÍA usar la librería en lugar de reimplementarla.
+El receptor recalcula el nonce con la clave efímera exactamente como la recibió y su propia clave pública, deriva la misma clave a partir de `X25519(target_sk, epk)` mediante HSalsa20 y abre la caja; una salida de X25519 toda ceros DEBE fallar, como en libsodium. La salida en bruto de X25519 **no** es la clave: los borradores hasta el 0.6 omitían el paso HSalsa20 en este pseudocódigo, y una caja construida así no se abre con libsodium. Es exactamente `crypto_box_seal` de libsodium (48 bytes de sobrecarga), disponible en todos los lenguajes; una implementación DEBERÍA usar la librería en lugar de reimplementarla. Un dispositivo cuya clave privada no puede salir de un almacén de claves de la plataforma toma la salida de X25519 del acuerdo de claves del almacén y aplica él mismo los pasos HSalsa20 y secretbox. Abrir una sealed box no autentica nada sobre el emisor: lo hace la firma que va dentro del cuerpo (§10.2).
 
 ---
 
@@ -525,7 +527,10 @@ El verificador DEBERÍA enviar un email, en el idioma de la petición, que conte
 
 - Enviar el enlace solo a la dirección indicada, nunca a otra.
 - Emitir la prueba solo después de que el usuario haya aceptado en la página de confirmación (§8.8); abrir el enlace sin más NO DEBE emitirla.
-- Limitar la frecuencia: DEBERÍA rechazar más de 5 peticiones por dirección y hora (`429` con `Retry-After`), aplicar límites por origen de red y PUEDE exigir una prueba de trabajo (§8.9).
+- Limitar la frecuencia, contando cada límite por separado para que una ventana corta nunca borre una más larga: DEBE rechazar más de 5 peticiones por dirección y hora y DEBERÍA rechazar más de 12 por dirección y día (`429` con el `Retry-After` real, §14); aplicar límites por origen de red y un techo global; acotar la emisión de desafíos por origen; y PUEDE exigir una prueba de trabajo (§8.9), subiendo su dificultad bajo carga.
+- Construir los enlaces del email solo a partir de sus propios nombres configurados, nunca del `Host` de la petición (§9), y no enviar nada por una petición que le llegó bajo otro nombre.
+- Conservar el token de confirmación solo como hash, no escribir nunca un enlace ni un token en un registro, y borrar la petición y cualquier copia guardada del correo cuando el token caduca.
+- Enviar el correo con una ruta de retorno cuyos rebotes no lee ninguna persona: un rebote lleva el enlace.
 - No conservar el email en claro tras emitir la prueba; conservar solo el `uid`.
 - Firmar `iat` con su propio reloj; `exp = iat + 30 días` como máximo.
 
@@ -541,7 +546,7 @@ Cuerpo:
 { "type": "revoke", "uid": "<uid>", "dev_pk": "<dev_pk a eliminar>", "by": "<clave firmante>", "iat": 1762560000, "sig": "<…>" }
 ```
 
-`sig` DEBE ser de una de estas claves: otro dispositivo vigente del mismo `uid` (`by` = su `dev_pk`), un verificador aceptado tras un nuevo enlace (`by` = `verifier_pk`) o el dominio (`by` = `dom_pk`). `iat` DEBE estar a menos de 5 minutos del reloj del nodo. El nodo DEBE borrar la entrada, propagarlo a sus réplicas y notificar `record_changed` (§9.3) a los clientes conectados suscritos a ese `uid`.
+`sig` DEBE ser de una de estas claves: otro dispositivo vigente del mismo `uid` (`by` = su `dev_pk`), un verificador aceptado tras un nuevo enlace (`by` = `verifier_pk`) o el dominio (`by` = `dom_pk`). `iat` DEBE estar a menos de 5 minutos del reloj del nodo. El nodo DEBE borrar la entrada, propagarlo a sus réplicas y notificar `record_changed` (§9.3) a los clientes conectados suscritos a ese `uid`. Una revocación surte efecto de inmediato: el nodo DEBE cerrar todas las sesiones del dispositivo revocado (§9.3) y DEBE rechazar una entrada posterior de ese `dev_pk` cuyo `proof.iat` no sea posterior al `iat` de la revocación, hasta que esa prueba hubiera caducado; una clave revocada solo vuelve con una prueba emitida después de la revocación. Las réplicas aplican la misma regla.
 
 ### 8.6 Recuperación
 
@@ -573,7 +578,7 @@ Un verificador envía emails en nombre de quien lo pida, así que es un objetivo
 2. **Problema.**
 
 ```
-preimagen = nonce ":" email_normalized ":" counter        (bytes ASCII, sin espacios)
+preimagen = nonce ":" email_normalized ":" counter        (bytes UTF-8, sin espacios)
 válida    = bits_a_cero_iniciales( SHA-256(preimagen) ) >= difficulty
 ```
 
@@ -601,7 +606,7 @@ Comprobaciones negativas: el contador `0124804` está mal formado (cero inicial)
 
 ## 9. API del nodo
 
-Toda la API vive bajo `<url>/7ks/v1/`. Las rutas de lectura son HTTPS sin autenticar; las de escritura llevan objetos firmados; la sesión del dispositivo es un WebSocket. Los nodos usan HTTPS porque son servidores ordinarios con nombres y certificados; los dispositivos nunca lo usan entre sí.
+Toda la API vive bajo `<url>/7ks/v1/`. Las rutas de lectura son HTTPS sin autenticar; las de escritura llevan objetos firmados; la sesión del dispositivo es un WebSocket. Los nodos usan HTTPS porque son servidores ordinarios con nombres y certificados; los dispositivos nunca lo usan entre sí. Un nodo DEBE responder solo bajo sus propios nombres (el host de su `url` y, en la federación pública, sus nombres de shard del Anexo A): una petición cuyo `Host` sea cualquier otro nombre se responde con `421` y `{ "error": "invalid", "detail": "host" }`, y ningún enlace, indicación o registro se construye jamás a partir de un `Host` que el nodo no posee.
 
 ### 9.1 Lecturas públicas
 
@@ -628,6 +633,8 @@ Estas rutas NO DEBEN exigir autenticación ni limitar por origen más allá de l
 
 Un nodo es responsable de un `uid` si: es el nodo de dominio de ese dominio, o es un nodo de shard del prefijo y el dominio no tiene entrada DNS. En cualquier otro caso responde `403` con `{ "error": "not_responsible", "responsible": ["<url>", "…"] }` si lo sabe. `PUT` y `DELETE` no necesitan sesión: el objeto lleva su propia autoridad. Un nodo DEBE rechazar (`invalid`) una entrada cuyos `homes` contengan una URL que no sea `https` o cuyo host no supere la regla de direcciones del §9.4, y DEBERÍA además exigir un registro de nodo válido en cada una (§9.4), porque otros nodos reenviarán a esas URL.
 
+Un nodo PUEDE limitar los dispositivos vigentes de una dirección por debajo del límite del §15 (los nodos de 7ks permiten 10). Una entrada que superaría el tope se responde con `429` y `{ "error": "limit", "detail": "<n> devices" }` y **sin** `Retry-After`: es una cuota, no una frecuencia, y esperar no la libera. Solo cuentan las entradas vigentes; las caducadas no. Las claves o codificaciones mal formadas en cualquier escritura son `400 invalid`, nunca un error del servidor.
+
 ### 9.3 Sesión del dispositivo (WebSocket)
 
 Un dispositivo conectado a un nodo abre `wss://<host de url>/7ks/v1/session` con el subprotocolo `Sec-WebSocket-Protocol: 7ksp.v1`. Mientras la sesión está abierta, el dispositivo está **en línea** en ese nodo. Cerrarla es desconectarse. No hay otro mecanismo de presencia.
@@ -653,6 +660,7 @@ Todos los mensajes son objetos JSON con `t` (tipo). Las peticiones llevan `id` (
 ```
 
 - El nodo DEBE comprobar que `dev_pk` tiene una entrada vigente para `uid`: en su propio directorio si es responsable; resolviendo (§7) si no. Un nodo PUEDE aceptar como home dispositivos de cualquier dominio; no necesita ser responsable de su directorio.
+- La sesión dura solo mientras esa entrada esté vigente. El nodo DEBE comprobarla de nuevo al atender cada mensaje del dispositivo y DEBE cerrar la sesión, tras `{ "t": "error", "code": "unauthorized" }`, en cuanto la entrada sea revocada (§8.5) o caduque. Un nodo DEBERÍA acotar lo que un dispositivo puede mantener: tramas de 64 KiB como máximo, 256 `uid` suscritos como máximo y un número pequeño de sesiones simultáneas por dispositivo (los nodos de 7ks permiten 4); más allá responde `limit`.
 - `domain` es el dominio de la dirección del dispositivo. No va firmado: un nodo que sirve el directorio de ese dominio lo ignora; cualquier otro lo necesita para resolver (§7), y un valor erróneo hace fallar la resolución y la sesión es `unauthorized`.
 - `host` impide que una firma sea válida en otro nodo. `nonce` impide la repetición.
 - `push` es opcional (§13). Un dispositivo de escritorio no lo envía.
@@ -817,6 +825,8 @@ Receptor
 
 En CONNECTED, la señalización a través del nodo solo se usa si se pierde el canal directo y hay que renegociarlo (§11.8); el `bye` de cierre PUEDE ir por el canal directo o a través del nodo.
 
+**Ofertas cruzadas.** Cuando un dispositivo recibe una `offer` de un dispositivo al que él mismo ha enviado una `offer` que sigue sin respuesta, para la misma aplicación, ambos están en OFFERED y uno debe ceder. El dispositivo cuyo `uid` seguido de `dev_pk` (las dos cadenas base64url concatenadas, comparadas byte a byte) es el **menor** mantiene su propia oferta y responde a la otra con `reject` y motivo `busy`; el otro descarta su propia oferta sin enviar `bye` y responde a la oferta que recibió. A partir de ahí el lado que cede NO DEBE enviar nada de la sesión que abandonó: una oferta, respuesta o candidato producido después por trabajo que ya estaba en curso se descarta.
+
 ### 10.6 Temporizadores
 
 | Evento | Valor |
@@ -899,8 +909,8 @@ Reglas:
 - El iniciador del handshake es el iniciador de la sesión (`offer`).
 - El receptor DEBE verificar que la clave estática descifrada es una `dev_dh` del `from.uid` de la oferta (el de la señalización sellada, que confirma el directorio). Si no lo es, DEBE descartar el mensaje sin responder.
 - El iniciador DEBE verificar que el mensaje del receptor se descifra con las claves derivadas de la `dev_dh` que esperaba. Un receptor equivocado no puede producirlo.
-- La carga útil de `handshake_init` es una marca de tiempo TAI64N de 12 bytes. El receptor DEBE rechazar una marca anterior a la última aceptada de esa clave estática (protección contra repetición) y DEBERÍA rechazar una que se aleje más de 90 s de su reloj.
-- Bajo carga, un receptor PUEDE ignorar los `handshake_init` que superen un límite por dirección de origen; el iniciador retransmite cada 1 s hasta 5 veces.
+- La carga útil de `handshake_init` es una marca de tiempo TAI64N de 12 bytes. Cada `handshake_init` que envía un dispositivo, retransmisiones incluidas, es un mensaje nuevo con una clave efímera nueva, un `sender_idx` nuevo y una marca estrictamente mayor que cualquiera que haya enviado antes a esa clave estática (si su reloj retrocedió, el valor anterior más un nanosegundo). El receptor DEBE rechazar una marca menor o igual que la última que aceptó de esa clave estática, de modo que el primer mensaje, que Noise deja repetible (Noise §7.7), nunca se acepta dos veces, y DEBERÍA rechazar una que se aleje más de 90 s de su reloj. Un `handshake_init` más reciente aceptado de la misma clave estática sustituye a la sesión que uno anterior dejó a medio abrir; la sesión sustituida se descarta cuando llega el primer paquete `data` con las claves nuevas, o a los 10 s.
+- Bajo carga, un receptor PUEDE ignorar los `handshake_init` que superen un límite por dirección de origen; el iniciador envía uno nuevo cada 1 s, hasta 5 veces.
 - Renovación de claves: un handshake nuevo sobre la misma sesión cada 120 s, o tras 2⁶⁰ paquetes, o cuando cualquiera de los dos lados quiera. Las claves antiguas siguen siendo válidas durante 10 s después de establecerse las nuevas.
 
 En el handshake no intervienen certificados, nombres ni firmas. La autenticación es Diffie-Hellman contra claves en las que los dos lados ya confían.
@@ -919,8 +929,8 @@ Todo paquete empieza por un byte de tipo. Los valores están elegidos para que u
 - `reserved`: tres bytes a cero. Un receptor DEBE ignorar su valor.
 - `sender_idx` / `receiver_idx`: 4 bytes aleatorios por sesión que elige cada lado. Un receptor encuentra la sesión por `receiver_idx` sin descifrar; en un mismo socket conviven varias sesiones.
 - `e`: clave pública X25519 efímera. `enc_s`: clave estática cifrada (32 + etiqueta de 16 bytes). `enc_ts`: marca de tiempo cifrada (12 + 16). `enc_empty`: carga útil vacía cifrada (solo la etiqueta).
-- `counter`: 64 bits, estrictamente creciente por clave de sesión, que se usa como nonce del AEAD (12 bytes: 4 bytes a cero + los 8 del contador). El receptor DEBE descartar contadores repetidos o fuera de la ventana (ventana de 2048 hacia atrás).
-- `AEAD(payload)`: ChaCha20-Poly1305 con la clave de sesión y el nonce; la etiqueta de 16 bytes va después del texto cifrado.
+- `counter`: 64 bits, en big-endian en la red como todos los enteros de estos paquetes, estrictamente creciente por clave de sesión y que empieza en 0 en cada sentido. Es el nonce `n` del CipherState de transporte de Noise, llevado de forma explícita porque los paquetes pueden perderse o desordenarse (Noise §11.4): un paquete `data` es `EncryptWithAd(vacío, payload)` con el CipherState de su sentido tras `SetNonce(counter)`. El nonce de 12 bytes del AEAD es por tanto el de Noise §12.3, 4 bytes a cero seguidos del contador en **little-endian**, en los paquetes de transporte exactamente igual que en el handshake; solo los 8 bytes de la red van en big-endian. El iniciador envía con el primer CipherState que devuelve `Split()` y recibe con el segundo. Una clave de sesión NO DEBE cifrar dos paquetes con el mismo contador. El receptor guarda el contador más alto que aceptó y una ventana de exactamente 2048 posiciones que lo incluye: un contador mayor se acepta y pasa a ser el más alto; uno menor no visto antes se acepta solo cuando `highest - counter < 2048`; cualquier otro se descarta. La ventana se actualiza solo después de verificar la etiqueta.
+- `AEAD(payload)`: ChaCha20-Poly1305 (RFC 8439) con la clave de sesión, ese nonce y **datos asociados vacíos**; la etiqueta de 16 bytes va después del texto cifrado. La cabecera en claro no se autentica como datos asociados: el contador queda ligado a través del nonce, `receiver_idx` solo selecciona la sesión y `reserved` se ignora.
 - Carga útil máxima: 1200 bytes, para evitar la fragmentación IP en cualquier camino (paquete máximo de 1232 bytes, por debajo de la MTU mínima de IPv6). Los datos de aplicación mayores los trocea la capa de streams.
 
 #### Primitivas en la red
@@ -1046,7 +1056,7 @@ Las respuestas HTTP usan códigos estándar y un cuerpo `{ "error": "<código>",
 | `unauthorized` | 401 | Autenticación de sesión o de nodo no válida |
 | `unavailable` | 503 | No se pudo contactar con el nodo responsable del destinatario o no respondió a tiempo; reintentar más tarde |
 
-Un `429` DEBERÍA llevar la cabecera `Retry-After` (RFC 9110 §10.2.3) con los segundos que hay que esperar. `detail` PUEDE nombrar la causa; los valores con significado definido son `challenge` y `pow` (§8.9) y `cancelled` (§8.8).
+Un `429` por frecuencia DEBE llevar la cabecera `Retry-After` (RFC 9110 §10.2.3) con el número real de segundos hasta que la petición pueda tener éxito, nunca una constante; un `429` por una cuota que esperar no libera (el tope de dispositivos del §9.2) no la lleva. `detail` PUEDE nombrar la causa; los valores con significado definido son `challenge`, `pow` y `rate` (§8.9, §8.3), `cancelled` (§8.8), `host` (§9), `keys` (claves mal formadas en una petición de verificación) y `<n> devices` (§9.2). Una petición bajo un nombre que el nodo no posee es `421` con `invalid` y detalle `host` (§9). Una entrada que el cliente hizo mal es siempre un `4xx`; un nodo NO DEBE responderla con un error del servidor.
 
 ---
 
@@ -1056,21 +1066,23 @@ Un `429` DEBERÍA llevar la cabecera `Retry-After` (RFC 9110 §10.2.3) con los s
 |---|---|
 | Sobre: `exp` máximo / tamaño | 120 s / 16 KB |
 | Entrada de dispositivo: `exp` máximo | 30 días; renovar a los 20 |
-| Dispositivos por `uid` | 32 |
+| Dispositivos por `uid` | 32; un nodo PUEDE poner un tope menor (§9.2; los nodos de 7ks: 10) |
 | `homes` / `endpoints` por entrada | 4 / 4 |
 | Token de verificación | 15 minutos |
-| Peticiones de verificación | 5 por dirección y hora |
+| Peticiones de verificación | 5 por dirección y hora y 12 por día; desafíos acotados por origen (§8.3) |
 | Vigilancias por vigilante / `ttl` | 256 / 7 días |
 | Credenciales de relay | 1 hora |
 | Relay por sesión | cuota del operador; recomendado 1 Mbit/s y 10 minutos |
 | Ping de la sesión WebSocket | 30 s; el nodo cierra tras 90 s sin tráfico |
+| Sesión: trama / suscripciones / sesiones por dispositivo | 64 KiB / 256 / a elección del nodo (los nodos de 7ks: 4) |
 | Tabla de shards: `exp` | 7 días |
 | Intento directo por `endpoints` | 3 s |
 | Sondas ICE: intervalo / total | 50–200 ms / 30 s |
 | `prange.count` | ≤ 20 |
 | Keepalive del canal | 15–25 s; muerto tras 3 perdidos |
-| Retransmisión del handshake (`noise`) | 1 s, 5 intentos |
+| Retransmisión del handshake (`noise`) | un `handshake_init` nuevo cada 1 s, 5 intentos |
 | Renovación de claves (`noise`) | 120 s o 2⁶⁰ paquetes |
+| Ventana de repetición (`noise`) | 2048 contadores incluido el más alto aceptado |
 | Carga útil del paquete (`noise`) | ≤ 1200 bytes |
 | Memoria de duplicados de sobres | 5 minutos |
 | Petición entre nodos: conexión / total | 5 s / 10 s |
@@ -1099,9 +1111,19 @@ Un `429` DEBERÍA llevar la cabecera `Retry-After` (RFC 9110 §10.2.3) con los s
 
 **Enumeración.** El `uid` es un hash sin sal, así que quien tenga una lista de direcciones de email puede comprobar cuáles están en el directorio público. Se acepta: el directorio no devuelve emails, solo claves, y los dominios con nodo propio no aparecen en él.
 
-**Altas masivas y envíos en masa.** El verificador es la única parte del protocolo que actúa en nombre de un desconocido, enviando un email. La prueba de trabajo (§8.9) hace que cada petición le cueste a quien la hace, los límites por dirección y por red (§8.3) acotan lo que queda, y no interviene ningún captcha de terceros, así que ningún dato de la petición sale del verificador.
+**Altas masivas y envíos en masa.** El verificador es la única parte del protocolo que actúa en nombre de un desconocido, enviando un email. La prueba de trabajo (§8.9) hace que cada petición le cueste a quien la hace, los límites por dirección y por red (§8.3) acotan lo que queda, y no interviene ningún captcha de terceros, así que ningún dato de la petición sale del verificador. Los límites se cuentan de forma independiente unos de otros, una dirección nunca recibe más de 12 correos al día, y a una petición rechazada se le dice la espera real (§8.3, §14).
 
 **Un enlace abierto por la persona equivocada.** Abrir un enlace no da acceso a nadie (§8.8): un analizador de enlaces o un destinatario curioso no cambian nada, y un usuario que ve un número que su dispositivo no muestra cancela la petición.
+
+**Enlaces bajo un nombre ajeno.** Un verificador que construyera sus enlaces a partir del `Host` de la petición enviaría, en su propio nombre, un enlace al origen que eligiera el solicitante; la víctima que lo abre entrega el token a ese origen. Los enlaces salen solo de los nombres configurados del nodo, y una petición bajo cualquier otro nombre se rechaza (§8.3, §9).
+
+**Una revocación que no muerde.** Quitar un dispositivo es la respuesta del usuario a un dispositivo perdido o robado, así que tiene que ser inmediata y definitiva: el nodo cierra las sesiones del dispositivo y rechaza su prueba antigua (§8.5, §9.3). Sin las dos reglas, quien tiene la clave revocada sigue conectado, o firma un `seq` mayor con la prueba que ya tenía y reaparece.
+
+**Rebotes.** El correo de verificación contiene el enlace. Un rebote devuelve ese correo al remitente del sobre; por eso el verificador usa una ruta de retorno que no lee ninguna persona, y trata un buzón de rebotes como trata los tokens (§8.3).
+
+**Sealed box y almacenes de claves.** La sealed box es la construcción de libsodium byte a byte (§2.4), incluido el paso HSalsa20 y el fallo ante un acuerdo todo ceros. Oculta el contenido al nodo y no autentica nada: la firma que va dentro del cuerpo y las comprobaciones de directorio del §10.2 deciden quién habla.
+
+**Repetición en el canal directo.** El primer mensaje del handshake de `Noise_IK` no lleva ninguna aportación del receptor y podría repetirse; la marca de tiempo estrictamente creciente lo impide (§11.4). Los paquetes de datos están protegidos por el contador y su ventana, y un contador nunca se repite bajo una misma clave.
 
 **Reenvío abierto.** Un nodo reenvía solo a URL que la resolución ha producido y que demuestran ser nodos (§9.4), nunca a una URL que un cliente o una entrada nombren por su cuenta, y acepta peticiones reenviadas solo de nodos que son home de los usuarios por los que hablan. Sin la primera regla un nodo sería un proxy hacia hosts arbitrarios, incluida su propia red privada; sin la segunda, cualquiera capaz de operar un nodo podría inundar a otro en nombre de usuarios inventados, y los avisos `online` se convertirían en un canal de spam de push.
 
@@ -1246,6 +1268,8 @@ Lo que una implementación DEBE cumplir, según su papel, para llamarse 7KSP/1. 
 - Reintenta lo pendiente al arrancar y al recuperar la red, y usa vigilancias (§12).
 - Envía `domain` con `auth`, `resolve` y `watch` y en los dos extremos de cada sobre (§9.3, §10.1), y nunca la dirección en sí fuera del cuerpo sellado.
 - Resuelve la prueba de trabajo del verificador cuando se le pide (§8.9) y muestra el número de la petición hasta que llega la prueba (§8.8).
+- Rechaza el base64url no canónico, el token JSON `-0` y las firmas que el RFC 8032 rechaza (§2.1, §2.2), y construye las sealed box exactamente como el §2.4.
+- Resuelve las ofertas cruzadas con la regla del §10.5 y no envía nada de una sesión que abandonó.
 
 **Cliente nativo, además**: perfil `noise` completo (§11.4, Anexo C), `endpoints` si los hay (§11.7), comportamiento móvil (§11.10).
 **Cliente web, además**: perfil `webrtc` (§11.5), anunciando solo ese perfil.
@@ -1253,6 +1277,8 @@ Lo que una implementación DEBE cumplir, según su papel, para llamarse 7KSP/1. 
 **Todo nodo**
 - Expone las rutas de lectura sin autenticación y las de escritura con validación completa (§9.1, §9.2).
 - Autentica las sesiones por desafío y comprueba la entrada del dispositivo (§9.3).
+- Termina una sesión cuando su entrada es revocada o caduca, y rechaza la prueba antigua de una clave revocada (§8.5, §9.3).
+- Responde solo bajo sus propios nombres (§9), con `4xx` para todo error del cliente y el `Retry-After` real en los límites de frecuencia (§14).
 - Nunca encola sobres, salvo la retención del push (§10.1, §13).
 - Entrega `connect` solo a dispositivos con sesión; responde `offline` y `unknown` según el §9.3.
 - Reenvía a otros nodos exactamente una vez, solo a nodos verificados en direcciones públicas, autentica las peticiones entre nodos, las acepta solo de los homes de los usuarios por los que hablan y responde `unavailable` cuando no puede contactar con el otro nodo (§9.4).
@@ -1270,7 +1296,9 @@ Lo que una implementación DEBE cumplir, según su papel, para llamarse 7KSP/1. 
 
 ## Historial
 
-- **0.6 (borrador, sin publicar)** — Contacto entre nodos completado: `domain` junto a cada `uid` que un nodo tiene que resolver (`auth`, `resolve`, `watch`, los dos extremos del sobre, el objeto de vigilancia); la autenticación entre nodos vincula al llamante con los usuarios por los que habla y la petición con el receptor (`url` en `Authorization`, `host` en el objeto firmado, memoria de repeticiones); reenvío solo a nodos verificados en direcciones públicas; `homes` comprobados al escribir; error `unavailable`; cachés, tiempos y cortacircuitos del nodo; convención de nombres de la federación pública (Anexo A); coincidencia de número en el enlace de alta: `lang` y `code`, una página de confirmación que no cambia nada con `GET` y acepta o cancela con `POST`, el estado `cancelled` (§8.8); prueba de trabajo opcional en la petición de verificación, con vectores de prueba (§8.9); `Retry-After` en `429` (§14). Dispositivos propios: §8.1 paso 8 (importar desde otro dispositivo o una exportación), §10.4 (un dispositivo puede abrir sesión con otro de su propia dirección), §16 (qué ve el nodo de ello), §17 (`7ks-sync/1`, `7ks-archive/1`).
+- **0.7 (borrador, sin publicar)** — Revisión de seguridad del 2026-11-09: la auditoría propia del responsable, la auditoría del equipo de la API y la revisión del equipo móvil, frente a Noise rev. 34, RFC 8032, RFC 8439, RFC 4648, RFC 8785 con la errata 7920, RFC 5321 y libsodium. Corrección: el pseudocódigo de la sealed box omitía la derivación de clave HSalsa20 de `crypto_box_seal` (§2.4). El perfil `noise` queda exacto (§11.4): los contadores empiezan en 0, el nonce del AEAD es el de Noise (little-endian) mientras que el contador en la red es big-endian, datos asociados vacíos, la ventana de repetición a la posición, y cada `handshake_init` es un mensaje nuevo con una marca de tiempo estrictamente mayor. Reglas nuevas: base64url canónico, `-0` rechazado, verificación del RFC 8032 (§2.1, §2.2); límites del verificador contados de forma independiente con un tope diario, enlaces solo a partir de los nombres propios del nodo, tokens guardados como hash y nunca registrados, rebotes (§8.3); una revocación cierra las sesiones y rechaza la prueba antigua (§8.5, §9.3); un nodo responde solo bajo sus propios nombres, `421` en otro caso (§9); la respuesta del tope de dispositivos y los límites de sesión (§9.2, §9.3, §15); ofertas cruzadas (§10.5); el `Retry-After` real y ningún error del servidor ante un error del cliente (§14); la preimagen de la prueba de trabajo son bytes UTF-8 (§8.9); cinco párrafos añadidos al §16.
+
+- **0.6** — Contacto entre nodos completado: `domain` junto a cada `uid` que un nodo tiene que resolver (`auth`, `resolve`, `watch`, los dos extremos del sobre, el objeto de vigilancia); la autenticación entre nodos vincula al llamante con los usuarios por los que habla y la petición con el receptor (`url` en `Authorization`, `host` en el objeto firmado, memoria de repeticiones); reenvío solo a nodos verificados en direcciones públicas; `homes` comprobados al escribir; error `unavailable`; cachés, tiempos y cortacircuitos del nodo; convención de nombres de la federación pública (Anexo A); coincidencia de número en el enlace de alta: `lang` y `code`, una página de confirmación que no cambia nada con `GET` y acepta o cancela con `POST`, el estado `cancelled` (§8.8); prueba de trabajo opcional en la petición de verificación, con vectores de prueba (§8.9); `Retry-After` en `429` (§14). Dispositivos propios: §8.1 paso 8 (importar desde otro dispositivo o una exportación), §10.4 (un dispositivo puede abrir sesión con otro de su propia dirección), §16 (qué ve el nodo de ello), §17 (`7ks-sync/1`, `7ks-archive/1`).
 - **0.5** — Reescritura para el máximo detalle y claridad: glosario, niveles de conformidad por papel, el recorrido de una conexión, algoritmos de validación y resolución en pseudocódigo, sealed box especificada, máquina de estados de la sesión, varios dispositivos, semántica exacta de `connect`, renovación y recuperación de la cuenta, explicación paso a paso del NAT, sección de móviles, ejemplos entre dominios y de entrega diferida, lista de comprobación de conformidad. Sin cambios en el formato de red respecto a la 0.4, salvo: `bye` lleva `reason`; `revoke` lleva `type`; subprotocolo WebSocket `7ksp.v1`; nonce del AEAD definido explícitamente.
 - **0.4** — Dos perfiles de transporte bajo un mismo protocolo: `noise` (nativo) y `webrtc` (navegadores y nativos que quieran hablar con ellos), negociados por sesión con `transports` en las entradas de dispositivo y en `offer`/`answer`; garantías idénticas, ambos sin autoridades de certificación; primitivas de aplicación asignadas a cada perfil; los clientes web vuelven al alcance como clientes solo `webrtc`.
 - **0.3** — Canal directo redefinido: solo UDP; handshake `Noise_IK` con las claves `dev_dh` de los dispositivos en lugar de TLS/DTLS; sin certificados ni SDP; requisitos completos de ICE; formato de paquetes y primitivas; streams fiables en el Anexo C; `endpoints`; `stun` y `roles.relay` en los registros de nodo.
