@@ -486,24 +486,28 @@ A single procedure signs up a new user, adds a device to an existing user and re
 Device                                          Verifier                           User's mailbox
     |                                                |                                   |
     | generates dev_pk, dev_dh                       |                                   |
-    |-- POST /7ks/v1/verify {email, dev_pk, dev_dh} ->|                                   |
-    |<- 202 {req_id} --------------------------------|                                   |
-    |                                                |-- email with link(token) --------->|
+    |-- GET /7ks/v1/verify/challenge --------------->|                                   |
+    |<- 200 {nonce, difficulty, exp} ----------------|                                   |
+    | solves the proof of work (§8.9)                |                                   |
+    |-- POST /7ks/v1/verify {email,keys,lang,pow} -->|                                   |
+    |<- 202 {req_id, code} --------------------------|                                   |
+    | shows the number (code)                        |-- email: number, link(token) ---->|
     |-- GET /7ks/v1/verify/<req_id> (waits 30 s) --->|                                   |
     |<- 202 (not yet) -------------------------------|                                   |
+    |                                                |<- user opens link, sees number ---|
+    |                                                |<- user presses Accept ------------|
     |-- GET /7ks/v1/verify/<req_id> ---------------->|                                   |
-    |                                                |<- user opens the link -------------|
     |<- 200 {proof} ---------------------------------|                                   |
     | builds and signs its device entry              |                                   |
-    |-- PUT /7ks/v1/record/<uid>/<dev_pk> {entry} ---> responsible node (domain or shards)
+    |-- PUT /7ks/v1/record/<uid>/<dev_pk> {entry} --> responsible node (domain or shards)
     |<- 204 -----------------------------------------|
 ```
 
 1. The device generates `dev_pk` and `dev_dh`.
 2. It picks a verifier: the domain node if the domain has a DNS entry; otherwise any node with `roles.verifier` whose key is in the federation's `verifiers`.
-3. `POST /verify` with the email in clear (the only operation of the protocol that carries the email) and its public keys. Response `202 {req_id}`.
+3. When the verifier requires it, the device asks for a challenge and solves it (§8.9). Then `POST /verify` with the email in clear (the only operation of the protocol that carries the email), its public keys, its language and the solution. Response `202 {req_id, code}`; the device shows the number `code` (§8.8).
 4. The verifier sends an email with two links carrying the same `token`: `https://<verifier>/7ks/v1/verify/<token>/confirm` to open in any browser, and `7ks:verify?token=<token>` to open directly in the application.
-5. The device waits with `GET /verify/<req_id>`. The server MAY hold the response for up to 30 s (long-poll); it answers `202` if not yet, `200 {proof}` once the token has been used, `410` if it expired.
+5. The user opens the link, sees the number and presses Accept (§8.8). Meanwhile the device waits with `GET /verify/<req_id>`. The server MAY hold the response for up to 30 s (long-poll); it answers `202` if not yet, `200 {proof}` once the user has accepted, `410` if it expired or was cancelled from the link.
 6. The device builds its device entry with the `proof`, signs it and publishes it with `PUT /record` (§9.2) on the responsible node: the domain node, or one of the shard nodes of the prefix (which replicates it to the others).
 7. The device opens a session on its home (§9.3). It is now online.
 
@@ -514,13 +518,13 @@ Rules on identifiers:
 
 ### 8.2 Email content
 
-The verifier SHOULD send an email containing: the device name if provided, the two links, the validity period and a sentence saying that if the user did not request anything they can ignore it. It MUST NOT include the keys or anything that identifies the request beyond the token.
+The verifier SHOULD send an email, in the language of the request, containing: the device name if provided, the number of the request (§8.8), the two links, the validity period and a sentence saying that if the user did not request anything they can ignore it. It MUST NOT include the keys or anything that identifies the request beyond the token.
 
 ### 8.3 Verifier obligations
 
 - Send the link only to the indicated address, never to another.
-- Issue the proof only after the token has been opened.
-- Rate-limit: SHOULD reject more than 5 requests per address per hour (`429`), and apply limits per network origin.
+- Issue the proof only after the user accepted on the confirmation page (§8.8); opening the link alone MUST NOT issue it.
+- Rate-limit: SHOULD reject more than 5 requests per address per hour (`429` with `Retry-After`), apply limits per network origin, and MAY require a proof of work (§8.9).
 - Not keep the email in clear after issuing the proof; keep only `uid`.
 - Sign `iat` with its own clock; `exp = iat + 30 days` at most.
 
@@ -546,6 +550,52 @@ Someone who has lost all their devices repeats enrollment on a new one: they obt
 
 A domain node MAY replace the link flow with whatever the domain decides (corporate login, manual enrollment, management by an administrator), as long as the result is a `domainsig`. The rest of the protocol does not change.
 
+### 8.8 Number match
+
+The link proves control of the mailbox, not that the person who opens it is the person in front of the device that asked. They are different people when someone requests a link for another person's address, and when a user opens an old or unexpected mail. The number match binds the two.
+
+1. The device MAY send `lang` in `POST /verify`: a lower-case primary language subtag (BCP 47), for example `en` or `es`. The verifier writes the email and the confirmation page in that language when it supports it, otherwise in its default language.
+2. The verifier generates `code`, three decimal digits chosen uniformly at random (`000` to `999`), and returns it in the answer: `202 { "req_id": "…", "code": "472" }`. The device MUST show the number while it waits, with the instruction to accept only if the page shows the same number.
+3. The email SHOULD carry the number, and the link SHOULD carry `?lang=<lang>`.
+4. `GET /verify/<token>/confirm` MUST NOT change any state. It returns a page that shows the number, the device name if one was given, and two buttons, Accept and Cancel, that submit a form `POST /verify/<token>/confirm` with `action=accept` or `action=cancel`. Opening the link, whether by the user, a link scanner or a browser prefetch, issues nothing.
+5. `action=accept` issues the proof and uses the token; the page tells the user to go back to the device. `action=cancel` cancels the request: the token is dead and `GET /verify/<req_id>` answers `410 { "error": "expired", "detail": "cancelled" }`, so the device can say that the request was cancelled from the link.
+6. A used, cancelled or expired token gets a page saying that the link is no longer valid (`410`), in the language of the request.
+7. An application that opens `7ks:verify?token=<token>` MUST show the same number and the same two choices before it sends the same `POST`.
+
+The number is short on purpose: a person compares it, nobody has to guess it, and the token, not the number, is the secret. Its job is to make the user stop when the page shows a number that their device does not.
+
+### 8.9 Proof of work on the request
+
+A verifier sends mail on behalf of whoever asks, so it is a target for mass sign-ups and mail flooding. In addition to the limits of §8.3, a verifier MAY require a proof of work on `POST /verify`. Every client MUST support it: it costs a fraction of a second on a phone and the user never sees it.
+
+1. **Challenge.** `GET /7ks/v1/verify/challenge` answers `200 { "v": 1, "nonce": "<base64url of 16 random bytes>", "difficulty": 18, "exp": 1762650120 }`. `nonce` is single use and valid until `exp`, at most 120 s after issue; `difficulty` is the number of leading zero bits required. A verifier that requires no work answers `404`, and the client sends its request without `pow`.
+2. **Puzzle.**
+
+```
+preimage = nonce ":" email_normalized ":" counter        (ASCII bytes, no spaces)
+valid    = leading_zero_bits( SHA-256(preimage) ) >= difficulty
+```
+
+   `nonce` is the 22-character string received. `email_normalized` is the address after §3.1, the same value the client sends in `email`, so a solution is bound to one address. `counter` is a decimal integer written without sign or leading zeros (`0` alone is valid), at most 20 digits. Leading zero bits are counted from the most significant bit of the first byte: `00 00 0f …` has 20.
+3. **Solution.** In the body of `POST /verify`: `"pow": { "nonce": "<nonce>", "counter": "<decimal string>" }`. `counter` is a string so that no question of number precision arises.
+4. **Verification, in this order.** `nonce` known, unused and not expired, otherwise `429 limit` with detail `challenge`; not answered sooner than 1 s after the challenge was issued, otherwise `429 limit`; `counter` well formed and the digest, recomputed with the verifier's own normalisation of `email`, has at least the `difficulty` of that nonce, otherwise `400 invalid` with detail `pow`. Then the verifier marks the nonce used and applies the limits of §8.3. A client SHOULD NOT send a solution sooner than 1 s after receiving the challenge; after a `429` it waits the seconds of `Retry-After` and asks for a new challenge.
+5. **Difficulty.** It SHOULD be 18 and MUST NOT exceed 24, so that every client finishes in seconds; a verifier MAY raise it within that bound under load. A client MAY abandon a challenge above 24.
+6. **Honeypot.** A verifier MAY treat a request whose `website` field is not empty as automated and answer it with a `202` that leads nowhere; the client's form renders that field invisible and never fills it. A client MUST NOT send `website` with content.
+
+Test vectors (computed with an independent SHA-256; every client and verifier MUST reproduce them):
+
+| | V3a | V3b |
+|---|---|---|
+| `nonce` | `AAECAwQFBgcICQoLDA0ODw` (bytes 00…0f) | `eywNj05qHJA19-K41KYOEQ` |
+| `email_normalized` | `alice@example.com` | `garacil@7kas.com` |
+| `difficulty` | 16 | 20 |
+| smallest valid `counter` | `124804` | `1618843` |
+| preimage | `AAECAwQFBgcICQoLDA0ODw:alice@example.com:124804` | `eywNj05qHJA19-K41KYOEQ:garacil@7kas.com:1618843` |
+| SHA-256 | `0000f1f226808091af52ba1e68804011af223db07de17c80f2a56fa60d9425a5` | `00000b8ffc4158d862b253574d1c6a4708f1846b11326208f94b27fe3b29e4a2` |
+| leading zero bits | 16 | 20 |
+
+Negative checks: the counter `0124804` is malformed (leading zero); V3a's counter with V3b's nonce does not validate; `Alice@Example.COM` normalised gives the V3a digest, the unnormalised string does not.
+
 ---
 
 ## 9. Node API
@@ -569,9 +619,11 @@ These routes MUST NOT require authentication or limit by origin beyond what is r
 |---|---|---|
 | `PUT /record/<uid hex>/<dev_pk>` | device entry (§4.2) | `204` · `400 invalid` · `409 seq` · `403 not_responsible` |
 | `DELETE /record/<uid hex>/<dev_pk>` | signed revocation (§8.5) | `204` · `400 invalid` · `403` |
-| `POST /verify` | `{ "email": "…", "dev_pk": "…", "dev_dh": "…", "name": "…" }` | `202 {req_id}` · `429 limit` · `403` if the node is not a verifier for that domain |
-| `GET /verify/<req_id>` | — | `200 {proof}` · `202` · `410 expired` |
-| `GET /verify/<token>/confirm` | — | HTML confirmation page; marks the token as used |
+| `GET /verify/challenge` | — | `200 {v, nonce, difficulty, exp}` (§8.9) · `404` if the verifier requires no work · `429 limit` |
+| `POST /verify` | `{ "email": "…", "dev_pk": "…", "dev_dh": "…", "name": "…", "lang": "en", "pow": { "nonce": "…", "counter": "…" } }` | `202 {req_id, code}` (§8.8) · `400 invalid` (detail `pow`) · `429 limit` with `Retry-After` · `403` if the node is not a verifier for that domain |
+| `GET /verify/<req_id>` | — | `200 {proof}` · `202` · `410 expired` (detail `cancelled` when cancelled from the link) |
+| `GET /verify/<token>/confirm` | — | HTML page with the number and the Accept and Cancel buttons (§8.8); changes nothing · `410` page when the link is no longer valid |
+| `POST /verify/<token>/confirm` | form `action=accept` or `action=cancel` | HTML page; `accept` uses the token and issues the proof, `cancel` cancels the request |
 
 A node is responsible for a `uid` if: it is the domain node of that domain, or it is a shard node of the prefix and the domain has no DNS entry. In any other case it answers `403` with `{ "error": "not_responsible", "responsible": ["<url>", "…"] }` if it knows. `PUT` and `DELETE` need no session: the object carries its own authority. A node MUST reject (`invalid`) an entry whose `homes` contain a URL that is not `https` or whose host does not pass the address rule of §9.4, and SHOULD also require a valid node record at each of them (§9.4), because other nodes will forward to those URLs.
 
@@ -991,6 +1043,8 @@ HTTP responses use standard codes and a body `{ "error": "<code>", "detail": "<f
 | `unauthorized` | 401 | Invalid session or node authentication |
 | `unavailable` | 503 | The node responsible for the target could not be reached or did not answer in time; retry later |
 
+A `429` SHOULD carry the `Retry-After` header (RFC 9110 §10.2.3) with the seconds to wait. `detail` MAY name the cause; the values with a defined meaning are `challenge` and `pow` (§8.9) and `cancelled` (§8.8).
+
 ---
 
 ## 15. Limits
@@ -1020,6 +1074,9 @@ HTTP responses use standard codes and a body `{ "error": "<code>", "detail": "<f
 | Node-to-node: homes tried per entry / circuit breaker | 4 / 30 s |
 | Node caches: validated records / node records and bindings | 1 hour / 24 hours |
 | Node-to-node replay memory | 5 minutes |
+| Number of a verification request | 3 decimal digits |
+| Proof-of-work challenge: validity / difficulty | 120 s / 18 recommended, 24 maximum |
+| Proof of work: minimum time from challenge to solution | 1 s |
 
 ---
 
@@ -1038,6 +1095,10 @@ HTTP responses use standard codes and a body `{ "error": "<code>", "detail": "<f
 **Handshake abuse.** `handshake_init` costs the receiver two Diffie-Hellman operations. A receiver under load MAY rate-limit by source address; since the initiator retransmits, legitimate sessions survive. The timestamp prevents replaying a captured `handshake_init`. DTLS has its own cookie mechanism.
 
 **Enumeration.** The `uid` is an unsalted hash, so whoever has a list of email addresses can check which ones are in the public directory. This is accepted: the directory returns no emails, only keys, and domains with their own node do not appear in it.
+
+**Mass sign-up and mail flooding.** The verifier is the only part of the protocol that acts on behalf of a stranger, by sending mail. The proof of work (§8.9) makes every request cost the requester, the limits per address and per network (§8.3) bound what remains, and no third-party captcha is involved, so no request data leaves the verifier.
+
+**A link opened by the wrong person.** Opening a link signs nobody in (§8.8): a link scanner or a curious recipient changes nothing, and a user who sees a number that their device does not show cancels the request.
 
 **Open forwarding.** A node forwards only to URLs that resolution produced and that prove to be nodes (§9.4), never to a URL a client or an entry names on its own, and it accepts forwarded requests only from nodes that are homes of the users they speak for. Without the first rule a node would be a proxy towards arbitrary hosts, including its own private network; without the second, anyone able to run a node could flood any other node in the name of invented users, and `online` notices would become a push-spam channel.
 
@@ -1180,6 +1241,7 @@ What an implementation MUST satisfy, per role, to call itself 7KSP/1. Each item 
 - Verifies the identity of the other end when establishing the channel (§11.4 or §11.5) and aborts on mismatch.
 - Retries pending work on startup and on network recovery, and uses watches (§12).
 - Sends `domain` with `auth`, `resolve` and `watch` and in both ends of every envelope (§9.3, §10.1), and never the address itself outside the sealed body.
+- Solves the verifier's proof of work when asked (§8.9) and shows the number of the request until the proof arrives (§8.8).
 
 **Native client, additionally**: full `noise` profile (§11.4, Annex C), `endpoints` if any (§11.7), mobile behaviour (§11.10).
 **Web client, additionally**: `webrtc` profile (§11.5), announcing only that profile.
@@ -1196,7 +1258,7 @@ What an implementation MUST satisfy, per role, to call itself 7KSP/1. Each item 
 
 **Domain node, additionally**: issues `domainsig` (§4.1, §8.7), is a verifier or delegates to the domain's procedure (§8).
 **Shard node, additionally**: keeps the signed table, replicates its prefixes, accepts writes only for its prefixes and rejects domains with DNS (§5.2, §6).
-**Verifier**: complies with §8.3.
+**Verifier**: complies with §8.3 and §8.8, and with §8.9 when it requires work.
 **Relay**: standard TURN with quotas and, where possible, TCP/TLS on 443 (§11.2).
 **Push gateway**: accepts `POST /7ks/v1/push` with no data beyond token and kind (§13).
 
@@ -1204,7 +1266,7 @@ What an implementation MUST satisfy, per role, to call itself 7KSP/1. Each item 
 
 ## History
 
-- **0.6 (draft, unreleased)** — Contact between nodes completed: `domain` beside every `uid` a node has to resolve (`auth`, `resolve`, `watch`, the two ends of the envelope, the watch object); node-to-node authentication binds the caller to the users it speaks for and the request to the receiver (`url` in `Authorization`, `host` in the signed object, replay memory); forwarding only to verified nodes on public addresses; `homes` checked on write; `unavailable` error; node caches, timeouts and circuit breaker; naming convention of the public federation (Annex A).
+- **0.6 (draft, unreleased)** — Contact between nodes completed: `domain` beside every `uid` a node has to resolve (`auth`, `resolve`, `watch`, the two ends of the envelope, the watch object); node-to-node authentication binds the caller to the users it speaks for and the request to the receiver (`url` in `Authorization`, `host` in the signed object, replay memory); forwarding only to verified nodes on public addresses; `homes` checked on write; `unavailable` error; node caches, timeouts and circuit breaker; naming convention of the public federation (Annex A); number match on the login link: `lang` and `code`, a confirmation page that changes nothing on `GET` and accepts or cancels on `POST`, the `cancelled` state (§8.8); optional proof of work on the verification request, with test vectors (§8.9); `Retry-After` on `429` (§14).
 - **0.5** — Rewrite for maximum detail and clarity: glossary, conformance levels per role, the journey of a connection, validation and resolution algorithms in pseudocode, sealed box specified, session state machine, several devices, exact semantics of `connect`, renewal and account recovery, step-by-step NAT explanation, mobile section, cross-domain and deferred-delivery examples, conformance checklist. No wire-format changes relative to 0.4 except: `bye` carries `reason`; `revoke` carries `type`; WebSocket subprotocol `7ksp.v1`; AEAD nonce defined explicitly.
 - **0.4** — Two transport profiles under one protocol: `noise` (native) and `webrtc` (browsers and natives wanting to reach them), negotiated per session with `transports` in device entries and in `offer`/`answer`; identical guarantees, both without certificate authorities; application primitives mapped to each profile; web clients back in scope as `webrtc`-only clients.
 - **0.3** — Direct channel redefined: UDP only; `Noise_IK` handshake with the devices' `dev_dh` keys instead of TLS/DTLS; no certificates or SDP; full ICE requirements; packet format and primitives; reliable streams in Annex C; `endpoints`; `stun` and `roles.relay` in node records.

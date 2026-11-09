@@ -486,24 +486,28 @@ Un único procedimiento da de alta a un usuario nuevo, añade un dispositivo a u
 Dispositivo                                     Verificador                        Buzón del usuario
     |                                                |                                   |
     | genera dev_pk, dev_dh                          |                                   |
-    |-- POST /7ks/v1/verify {email, dev_pk, dev_dh} ->|                                   |
-    |<- 202 {req_id} --------------------------------|                                   |
-    |                                                |-- email con enlace(token) -------->|
+    |-- GET /7ks/v1/verify/challenge --------------->|                                   |
+    |<- 200 {nonce, difficulty, exp} ----------------|                                   |
+    | resuelve la prueba de trabajo (§8.9)           |                                   |
+    |-- POST /7ks/v1/verify {email,keys,lang,pow} -->|                                   |
+    |<- 202 {req_id, code} --------------------------|                                   |
+    | muestra el número (code)                       |-- email: número, enlace(token) -->|
     |-- GET /7ks/v1/verify/<req_id> (espera 30 s) -->|                                   |
     |<- 202 (todavía no) ----------------------------|                                   |
+    |                                                |<- abre el enlace, ve el número ---|
+    |                                                |<- pulsa Aceptar ------------------|
     |-- GET /7ks/v1/verify/<req_id> ---------------->|                                   |
-    |                                                |<- el usuario abre el enlace -------|
     |<- 200 {proof} ---------------------------------|                                   |
-    | construye y firma su entrada de dispositivo    |                                   |
-    |-- PUT /7ks/v1/record/<uid>/<dev_pk> {entrada} -> nodo responsable (dominio o shards)
+    | construye y firma su entrada                   |                                   |
+    |-- PUT /7ks/v1/record/<uid>/<dev_pk> {entrada} --> nodo responsable (dominio o shards)
     |<- 204 -----------------------------------------|
 ```
 
 1. El dispositivo genera `dev_pk` y `dev_dh`.
 2. Elige un verificador: el nodo de dominio si el dominio tiene entrada DNS; si no, cualquier nodo con `roles.verifier` cuya clave esté en los `verifiers` de la federación.
-3. `POST /verify` con el email en claro (la única operación del protocolo que lleva el email) y sus claves públicas. Respuesta `202 {req_id}`.
+3. Si el verificador lo exige, el dispositivo pide un desafío y lo resuelve (§8.9). Después, `POST /verify` con el email en claro (la única operación del protocolo que lleva el email), sus claves públicas, su idioma y la solución. Respuesta `202 {req_id, code}`; el dispositivo muestra el número `code` (§8.8).
 4. El verificador envía un email con dos enlaces que llevan el mismo `token`: `https://<verificador>/7ks/v1/verify/<token>/confirm` para abrir en cualquier navegador, y `7ks:verify?token=<token>` para abrir directamente en la aplicación.
-5. El dispositivo espera con `GET /verify/<req_id>`. El servidor PUEDE retener la respuesta hasta 30 s (long-poll); responde `202` si todavía no, `200 {proof}` cuando se ha usado el token y `410` si caducó.
+5. El usuario abre el enlace, ve el número y pulsa Aceptar (§8.8). Mientras tanto, el dispositivo espera con `GET /verify/<req_id>`. El servidor PUEDE retener la respuesta hasta 30 s (long-poll); responde `202` si todavía no, `200 {proof}` cuando el usuario ha aceptado y `410` si caducó o se canceló desde el enlace.
 6. El dispositivo construye su entrada de dispositivo con la `proof`, la firma y la publica con `PUT /record` (§9.2) en el nodo responsable: el nodo de dominio, o uno de los nodos de shard del prefijo (que la replica a los demás).
 7. El dispositivo abre una sesión en su home (§9.3). Ya está en línea.
 
@@ -514,13 +518,13 @@ Reglas sobre los identificadores:
 
 ### 8.2 Contenido del email
 
-El verificador DEBERÍA enviar un email que contenga: el nombre del dispositivo si se indicó, los dos enlaces, el plazo de validez y una frase diciendo que, si el usuario no ha pedido nada, puede ignorarlo. NO DEBE incluir las claves ni nada que identifique la petición más allá del token.
+El verificador DEBERÍA enviar un email, en el idioma de la petición, que contenga: el nombre del dispositivo si se indicó, el número de la petición (§8.8), los dos enlaces, el plazo de validez y una frase diciendo que, si el usuario no ha pedido nada, puede ignorarlo. NO DEBE incluir las claves ni nada que identifique la petición más allá del token.
 
 ### 8.3 Obligaciones del verificador
 
 - Enviar el enlace solo a la dirección indicada, nunca a otra.
-- Emitir la prueba solo después de que se haya abierto el token.
-- Limitar la frecuencia: DEBERÍA rechazar más de 5 peticiones por dirección y hora (`429`), y aplicar límites por origen de red.
+- Emitir la prueba solo después de que el usuario haya aceptado en la página de confirmación (§8.8); abrir el enlace sin más NO DEBE emitirla.
+- Limitar la frecuencia: DEBERÍA rechazar más de 5 peticiones por dirección y hora (`429` con `Retry-After`), aplicar límites por origen de red y PUEDE exigir una prueba de trabajo (§8.9).
 - No conservar el email en claro tras emitir la prueba; conservar solo el `uid`.
 - Firmar `iat` con su propio reloj; `exp = iat + 30 días` como máximo.
 
@@ -546,6 +550,52 @@ Quien ha perdido todos sus dispositivos repite el alta en uno nuevo: obtiene una
 
 Un nodo de dominio PUEDE sustituir el flujo del enlace por lo que decida el dominio (login corporativo, alta manual, gestión por un administrador), siempre que el resultado sea una `domainsig`. El resto del protocolo no cambia.
 
+### 8.8 Coincidencia de número
+
+El enlace demuestra el control del buzón, no que quien lo abre sea la persona que está ante el dispositivo que lo pidió. Son personas distintas cuando alguien pide un enlace para la dirección de otro, y cuando un usuario abre un email antiguo o inesperado. La coincidencia de número une a las dos.
+
+1. El dispositivo PUEDE enviar `lang` en `POST /verify`: una subetiqueta de idioma principal en minúsculas (BCP 47), por ejemplo `en` o `es`. El verificador escribe el email y la página de confirmación en ese idioma si lo admite y, si no, en su idioma por defecto.
+2. El verificador genera `code`, tres dígitos decimales elegidos al azar de forma uniforme (`000` a `999`), y lo devuelve en la respuesta: `202 { "req_id": "…", "code": "472" }`. El dispositivo DEBE mostrar el número mientras espera, con la indicación de aceptar solo si la página muestra el mismo número.
+3. El email DEBERÍA llevar el número, y el enlace DEBERÍA llevar `?lang=<lang>`.
+4. `GET /verify/<token>/confirm` NO DEBE cambiar ningún estado. Devuelve una página que muestra el número, el nombre del dispositivo si se indicó y dos botones, Aceptar y Cancelar, que envían un formulario `POST /verify/<token>/confirm` con `action=accept` o `action=cancel`. Abrir el enlace, ya sea el usuario, un analizador de enlaces o una precarga del navegador, no emite nada.
+5. `action=accept` emite la prueba y gasta el token; la página indica al usuario que vuelva al dispositivo. `action=cancel` cancela la petición: el token queda inservible y `GET /verify/<req_id>` responde `410 { "error": "expired", "detail": "cancelled" }`, para que el dispositivo pueda decir que la petición se canceló desde el enlace.
+6. Un token usado, cancelado o caducado recibe una página que dice que el enlace ya no es válido (`410`), en el idioma de la petición.
+7. Una aplicación que abre `7ks:verify?token=<token>` DEBE mostrar el mismo número y las mismas dos opciones antes de enviar el mismo `POST`.
+
+El número es corto a propósito: lo compara una persona, nadie tiene que adivinarlo, y el secreto es el token, no el número. Su función es que el usuario se detenga cuando la página muestra un número que su dispositivo no muestra.
+
+### 8.9 Prueba de trabajo en la petición
+
+Un verificador envía emails en nombre de quien lo pida, así que es un objetivo para altas masivas y envíos en masa. Además de los límites del §8.3, un verificador PUEDE exigir una prueba de trabajo en `POST /verify`. Todo cliente DEBE admitirla: cuesta una fracción de segundo en un teléfono y el usuario nunca la ve.
+
+1. **Desafío.** `GET /7ks/v1/verify/challenge` responde `200 { "v": 1, "nonce": "<base64url de 16 bytes aleatorios>", "difficulty": 18, "exp": 1762650120 }`. `nonce` es de un solo uso y vale hasta `exp`, como máximo 120 s después de emitirse; `difficulty` es el número de bits a cero iniciales que se exige. Un verificador que no exige trabajo responde `404`, y el cliente envía su petición sin `pow`.
+2. **Problema.**
+
+```
+preimagen = nonce ":" email_normalized ":" counter        (bytes ASCII, sin espacios)
+válida    = bits_a_cero_iniciales( SHA-256(preimagen) ) >= difficulty
+```
+
+   `nonce` es la cadena de 22 caracteres recibida. `email_normalized` es la dirección tras el §3.1, el mismo valor que el cliente envía en `email`, de modo que una solución queda ligada a una dirección. `counter` es un entero decimal escrito sin signo ni ceros a la izquierda (`0` solo es válido), de 20 dígitos como máximo. Los bits a cero iniciales se cuentan desde el bit más significativo del primer byte: `00 00 0f …` tiene 20.
+3. **Solución.** En el cuerpo de `POST /verify`: `"pow": { "nonce": "<nonce>", "counter": "<cadena decimal>" }`. `counter` es una cadena para que no surja ninguna duda de precisión numérica.
+4. **Verificación, en este orden.** `nonce` conocido, sin usar y sin caducar; si no, `429 limit` con detalle `challenge`. No respondido antes de 1 s desde que se emitió el desafío; si no, `429 limit`. `counter` bien formado y el resumen, recalculado con la normalización de `email` del propio verificador, con al menos la `difficulty` de ese nonce; si no, `400 invalid` con detalle `pow`. Después el verificador marca el nonce como usado y aplica los límites del §8.3. Un cliente NO DEBERÍA enviar una solución antes de 1 s desde que recibió el desafío; tras un `429` espera los segundos de `Retry-After` y pide un desafío nuevo.
+5. **Dificultad.** DEBERÍA ser 18 y NO DEBE superar 24, para que todo cliente termine en segundos; un verificador PUEDE subirla dentro de ese límite cuando tiene carga. Un cliente PUEDE abandonar un desafío por encima de 24.
+6. **Señuelo.** Un verificador PUEDE tratar como automática una petición cuyo campo `website` no esté vacío y responderla con un `202` que no lleva a ninguna parte; el formulario del cliente muestra ese campo invisible y nunca lo rellena. Un cliente NO DEBE enviar `website` con contenido.
+
+Vectores de prueba (calculados con un SHA-256 independiente; todo cliente y todo verificador DEBEN reproducirlos):
+
+| | V3a | V3b |
+|---|---|---|
+| `nonce` | `AAECAwQFBgcICQoLDA0ODw` (bytes 00…0f) | `eywNj05qHJA19-K41KYOEQ` |
+| `email_normalized` | `alice@example.com` | `garacil@7kas.com` |
+| `difficulty` | 16 | 20 |
+| menor `counter` válido | `124804` | `1618843` |
+| preimagen | `AAECAwQFBgcICQoLDA0ODw:alice@example.com:124804` | `eywNj05qHJA19-K41KYOEQ:garacil@7kas.com:1618843` |
+| SHA-256 | `0000f1f226808091af52ba1e68804011af223db07de17c80f2a56fa60d9425a5` | `00000b8ffc4158d862b253574d1c6a4708f1846b11326208f94b27fe3b29e4a2` |
+| bits a cero iniciales | 16 | 20 |
+
+Comprobaciones negativas: el contador `0124804` está mal formado (cero inicial); el contador de V3a con el nonce de V3b no valida; `Alice@Example.COM` normalizado da el resumen de V3a, la cadena sin normalizar no.
+
 ---
 
 ## 9. API del nodo
@@ -569,9 +619,11 @@ Estas rutas NO DEBEN exigir autenticación ni limitar por origen más allá de l
 |---|---|---|
 | `PUT /record/<uid hex>/<dev_pk>` | entrada de dispositivo (§4.2) | `204` · `400 invalid` · `409 seq` · `403 not_responsible` |
 | `DELETE /record/<uid hex>/<dev_pk>` | revocación firmada (§8.5) | `204` · `400 invalid` · `403` |
-| `POST /verify` | `{ "email": "…", "dev_pk": "…", "dev_dh": "…", "name": "…" }` | `202 {req_id}` · `429 limit` · `403` si el nodo no es verificador de ese dominio |
-| `GET /verify/<req_id>` | — | `200 {proof}` · `202` · `410 expired` |
-| `GET /verify/<token>/confirm` | — | página HTML de confirmación; marca el token como usado |
+| `GET /verify/challenge` | — | `200 {v, nonce, difficulty, exp}` (§8.9) · `404` si el verificador no exige trabajo · `429 limit` |
+| `POST /verify` | `{ "email": "…", "dev_pk": "…", "dev_dh": "…", "name": "…", "lang": "es", "pow": { "nonce": "…", "counter": "…" } }` | `202 {req_id, code}` (§8.8) · `400 invalid` (detalle `pow`) · `429 limit` con `Retry-After` · `403` si el nodo no es verificador de ese dominio |
+| `GET /verify/<req_id>` | — | `200 {proof}` · `202` · `410 expired` (detalle `cancelled` si se canceló desde el enlace) |
+| `GET /verify/<token>/confirm` | — | página HTML con el número y los botones Aceptar y Cancelar (§8.8); no cambia nada · página `410` si el enlace ya no es válido |
+| `POST /verify/<token>/confirm` | formulario `action=accept` o `action=cancel` | página HTML; `accept` gasta el token y emite la prueba, `cancel` cancela la petición |
 
 Un nodo es responsable de un `uid` si: es el nodo de dominio de ese dominio, o es un nodo de shard del prefijo y el dominio no tiene entrada DNS. En cualquier otro caso responde `403` con `{ "error": "not_responsible", "responsible": ["<url>", "…"] }` si lo sabe. `PUT` y `DELETE` no necesitan sesión: el objeto lleva su propia autoridad. Un nodo DEBE rechazar (`invalid`) una entrada cuyos `homes` contengan una URL que no sea `https` o cuyo host no supere la regla de direcciones del §9.4, y DEBERÍA además exigir un registro de nodo válido en cada una (§9.4), porque otros nodos reenviarán a esas URL.
 
@@ -991,6 +1043,8 @@ Las respuestas HTTP usan códigos estándar y un cuerpo `{ "error": "<código>",
 | `unauthorized` | 401 | Autenticación de sesión o de nodo no válida |
 | `unavailable` | 503 | No se pudo contactar con el nodo responsable del destinatario o no respondió a tiempo; reintentar más tarde |
 
+Un `429` DEBERÍA llevar la cabecera `Retry-After` (RFC 9110 §10.2.3) con los segundos que hay que esperar. `detail` PUEDE nombrar la causa; los valores con significado definido son `challenge` y `pow` (§8.9) y `cancelled` (§8.8).
+
 ---
 
 ## 15. Límites
@@ -1020,6 +1074,9 @@ Las respuestas HTTP usan códigos estándar y un cuerpo `{ "error": "<código>",
 | Entre nodos: homes probados por entrada / cortacircuitos | 4 / 30 s |
 | Cachés del nodo: registros validados / registros de nodo y asociaciones | 1 hora / 24 horas |
 | Memoria de repeticiones entre nodos | 5 minutos |
+| Número de una petición de verificación | 3 dígitos decimales |
+| Desafío de prueba de trabajo: validez / dificultad | 120 s / 18 recomendada, 24 como máximo |
+| Prueba de trabajo: tiempo mínimo entre desafío y solución | 1 s |
 
 ---
 
@@ -1038,6 +1095,10 @@ Las respuestas HTTP usan códigos estándar y un cuerpo `{ "error": "<código>",
 **Abuso del handshake.** Un `handshake_init` le cuesta al receptor dos operaciones Diffie-Hellman. Un receptor bajo carga PUEDE limitar la frecuencia por dirección de origen; como el iniciador retransmite, las sesiones legítimas sobreviven. La marca de tiempo impide repetir un `handshake_init` capturado. DTLS tiene su propio mecanismo de cookies.
 
 **Enumeración.** El `uid` es un hash sin sal, así que quien tenga una lista de direcciones de email puede comprobar cuáles están en el directorio público. Se acepta: el directorio no devuelve emails, solo claves, y los dominios con nodo propio no aparecen en él.
+
+**Altas masivas y envíos en masa.** El verificador es la única parte del protocolo que actúa en nombre de un desconocido, enviando un email. La prueba de trabajo (§8.9) hace que cada petición le cueste a quien la hace, los límites por dirección y por red (§8.3) acotan lo que queda, y no interviene ningún captcha de terceros, así que ningún dato de la petición sale del verificador.
+
+**Un enlace abierto por la persona equivocada.** Abrir un enlace no da acceso a nadie (§8.8): un analizador de enlaces o un destinatario curioso no cambian nada, y un usuario que ve un número que su dispositivo no muestra cancela la petición.
 
 **Reenvío abierto.** Un nodo reenvía solo a URL que la resolución ha producido y que demuestran ser nodos (§9.4), nunca a una URL que un cliente o una entrada nombren por su cuenta, y acepta peticiones reenviadas solo de nodos que son home de los usuarios por los que hablan. Sin la primera regla un nodo sería un proxy hacia hosts arbitrarios, incluida su propia red privada; sin la segunda, cualquiera capaz de operar un nodo podría inundar a otro en nombre de usuarios inventados, y los avisos `online` se convertirían en un canal de spam de push.
 
@@ -1180,6 +1241,7 @@ Lo que una implementación DEBE cumplir, según su papel, para llamarse 7KSP/1. 
 - Verifica la identidad del otro extremo al establecer el canal (§11.4 o §11.5) y aborta si no coincide.
 - Reintenta lo pendiente al arrancar y al recuperar la red, y usa vigilancias (§12).
 - Envía `domain` con `auth`, `resolve` y `watch` y en los dos extremos de cada sobre (§9.3, §10.1), y nunca la dirección en sí fuera del cuerpo sellado.
+- Resuelve la prueba de trabajo del verificador cuando se le pide (§8.9) y muestra el número de la petición hasta que llega la prueba (§8.8).
 
 **Cliente nativo, además**: perfil `noise` completo (§11.4, Anexo C), `endpoints` si los hay (§11.7), comportamiento móvil (§11.10).
 **Cliente web, además**: perfil `webrtc` (§11.5), anunciando solo ese perfil.
@@ -1196,7 +1258,7 @@ Lo que una implementación DEBE cumplir, según su papel, para llamarse 7KSP/1. 
 
 **Nodo de dominio, además**: emite `domainsig` (§4.1, §8.7) y es verificador o delega en el procedimiento del dominio (§8).
 **Nodo de shard, además**: mantiene la tabla firmada, replica sus prefijos, acepta escrituras solo de sus prefijos y rechaza los dominios con DNS (§5.2, §6).
-**Verificador**: cumple el §8.3.
+**Verificador**: cumple el §8.3 y el §8.8, y el §8.9 cuando exige trabajo.
 **Relay**: TURN estándar con cuotas y, cuando sea posible, TCP/TLS en el 443 (§11.2).
 **Pasarela de push**: acepta `POST /7ks/v1/push` sin más datos que el token y el tipo (§13).
 
@@ -1204,7 +1266,7 @@ Lo que una implementación DEBE cumplir, según su papel, para llamarse 7KSP/1. 
 
 ## Historial
 
-- **0.6 (borrador, sin publicar)** — Contacto entre nodos completado: `domain` junto a cada `uid` que un nodo tiene que resolver (`auth`, `resolve`, `watch`, los dos extremos del sobre, el objeto de vigilancia); la autenticación entre nodos vincula al llamante con los usuarios por los que habla y la petición con el receptor (`url` en `Authorization`, `host` en el objeto firmado, memoria de repeticiones); reenvío solo a nodos verificados en direcciones públicas; `homes` comprobados al escribir; error `unavailable`; cachés, tiempos y cortacircuitos del nodo; convención de nombres de la federación pública (Anexo A).
+- **0.6 (borrador, sin publicar)** — Contacto entre nodos completado: `domain` junto a cada `uid` que un nodo tiene que resolver (`auth`, `resolve`, `watch`, los dos extremos del sobre, el objeto de vigilancia); la autenticación entre nodos vincula al llamante con los usuarios por los que habla y la petición con el receptor (`url` en `Authorization`, `host` en el objeto firmado, memoria de repeticiones); reenvío solo a nodos verificados en direcciones públicas; `homes` comprobados al escribir; error `unavailable`; cachés, tiempos y cortacircuitos del nodo; convención de nombres de la federación pública (Anexo A); coincidencia de número en el enlace de alta: `lang` y `code`, una página de confirmación que no cambia nada con `GET` y acepta o cancela con `POST`, el estado `cancelled` (§8.8); prueba de trabajo opcional en la petición de verificación, con vectores de prueba (§8.9); `Retry-After` en `429` (§14).
 - **0.5** — Reescritura para el máximo detalle y claridad: glosario, niveles de conformidad por papel, el recorrido de una conexión, algoritmos de validación y resolución en pseudocódigo, sealed box especificada, máquina de estados de la sesión, varios dispositivos, semántica exacta de `connect`, renovación y recuperación de la cuenta, explicación paso a paso del NAT, sección de móviles, ejemplos entre dominios y de entrega diferida, lista de comprobación de conformidad. Sin cambios en el formato de red respecto a la 0.4, salvo: `bye` lleva `reason`; `revoke` lleva `type`; subprotocolo WebSocket `7ksp.v1`; nonce del AEAD definido explícitamente.
 - **0.4** — Dos perfiles de transporte bajo un mismo protocolo: `noise` (nativo) y `webrtc` (navegadores y nativos que quieran hablar con ellos), negociados por sesión con `transports` en las entradas de dispositivo y en `offer`/`answer`; garantías idénticas, ambos sin autoridades de certificación; primitivas de aplicación asignadas a cada perfil; los clientes web vuelven al alcance como clientes solo `webrtc`.
 - **0.3** — Canal directo redefinido: solo UDP; handshake `Noise_IK` con las claves `dev_dh` de los dispositivos en lugar de TLS/DTLS; sin certificados ni SDP; requisitos completos de ICE; formato de paquetes y primitivas; streams fiables en el Anexo C; `endpoints`; `stun` y `roles.relay` en los registros de nodo.
