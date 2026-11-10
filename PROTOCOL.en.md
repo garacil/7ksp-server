@@ -1,6 +1,6 @@
 # 7KSP/1 — 7ks Protocol
 
-Protocol version: 1. Document status: draft 0.7 (draft, unreleased).
+Protocol version: 1. Document status: draft 0.8 (draft, unreleased).
 
 7KSP is an open and free protocol that, starting from an email address, opens a direct, encrypted, authenticated channel between two devices. This document contains everything needed to implement an interoperable client or node without consulting any other source. It is written so that a complete implementation fits in a few thousand lines in any language, using only standard components: HTTPS and WebSocket towards nodes, JSON, Ed25519, X25519, the Noise framework, STUN, UDP and, where a browser is involved, WebRTC.
 
@@ -546,7 +546,7 @@ Body:
 { "type": "revoke", "uid": "<uid>", "dev_pk": "<dev_pk to remove>", "by": "<signing key>", "iat": 1762560000, "sig": "<…>" }
 ```
 
-`sig` MUST be from one of these keys: another current device of the same `uid` (`by` = its `dev_pk`), an accepted verifier after a new link (`by` = `verifier_pk`), or the domain (`by` = `dom_pk`). `iat` MUST be within 5 minutes of the node's clock. The node MUST delete the entry, propagate it to its replicas and notify `record_changed` (§9.3) to connected clients subscribed to that `uid`. A revocation takes effect at once: the node MUST close every session of the revoked device (§9.3), and MUST refuse a later entry for that `dev_pk` whose `proof.iat` is not later than the `iat` of the revocation, until that proof would have expired; a revoked key returns only with a proof issued after the revocation. Replicas apply the same rule.
+`sig` MUST be from one of these keys: the device itself, which signs out and frees its place (`by` = the `dev_pk` being removed), another current device of the same `uid` (`by` = its `dev_pk`), an accepted verifier after a new link (`by` = `verifier_pk`), or the domain (`by` = `dom_pk`). A device can revoke itself only while it is current, and it removes no other device that way. `iat` MUST be within 5 minutes of the node's clock. The node MUST delete the entry, propagate it to its replicas and notify `record_changed` (§9.3) to connected clients subscribed to that `uid`. A revocation takes effect at once: the node MUST close every session of the revoked device (§9.3), and MUST refuse a later entry for that `dev_pk` whose `proof.iat` is not later than the `iat` of the revocation, until that proof would have expired; a revoked key returns only with a proof issued after the revocation. Replicas apply the same rule.
 
 ### 8.6 Recovery
 
@@ -625,6 +625,7 @@ These routes MUST NOT require authentication or limit by origin beyond what is r
 |---|---|---|
 | `PUT /record/<uid hex>/<dev_pk>` | device entry (§4.2) | `204` · `400 invalid` · `409 seq` · `403 not_responsible` |
 | `DELETE /record/<uid hex>/<dev_pk>` | signed revocation (§8.5) | `204` · `400 invalid` · `403` |
+| `POST /verify/<req_id>/revoke` | `{ "dev_pk": "…" }`, legacy admission only (below) | `200 {revoked, revoke}` · `400 invalid` · `403` · `404` · `410` · `429 limit` |
 | `GET /verify/challenge` | — | `200 {v, nonce, difficulty, exp}` (§8.9) · `404` if the verifier requires no work · `429 limit` |
 | `POST /verify` | `{ "email": "…", "dev_pk": "…", "dev_dh": "…", "name": "…", "lang": "en", "pow": { "nonce": "…", "counter": "…" } }` | `202 {req_id, code}` (§8.8) · `400 invalid` (detail `pow`) · `429 limit` with `Retry-After` · `403` if the node is not a verifier for that domain |
 | `GET /verify/<req_id>` | — | `200 {proof}` · `202` · `410 expired` (detail `cancelled` when cancelled from the link) |
@@ -634,6 +635,14 @@ These routes MUST NOT require authentication or limit by origin beyond what is r
 A node is responsible for a `uid` if: it is the domain node of that domain, or it is a shard node of the prefix and the domain has no DNS entry. In any other case it answers `403` with `{ "error": "not_responsible", "responsible": ["<url>", "…"] }` if it knows. `PUT` and `DELETE` need no session: the object carries its own authority. A node MUST reject (`invalid`) an entry whose `homes` contain a URL that is not `https` or whose host does not pass the address rule of §9.4, and SHOULD also require a valid node record at each of them (§9.4), because other nodes will forward to those URLs.
 
 A node MAY cap the current devices of an address below the limit of §15 (the 7ks nodes allow 10). An entry that would exceed the cap is answered `429` with `{ "error": "limit", "detail": "<n> devices" }` and **no** `Retry-After`: it is a quota, not a rate, and waiting does not clear it. Only current entries count; expired ones do not. Malformed keys or encodings in any write are `400 invalid`, never a server error.
+
+**Removing one device at the cap during legacy enrollment.** A node that still admits devices by the email-link flow alone MAY expose `POST /7ks/v1/verify/<req_id>/revoke`, with JSON `{ "dev_pk": "<chosen key>" }`. This is a temporary legacy-admission policy; a node enforcing approval by an existing device MUST refuse this bearer operation. The request identifier is private, not the public proof itself.
+
+Check in this exact order; the first failure changes no state: (1) object body with a canonical 32-byte dev_pk, otherwise 400 invalid detail dev_pk; (2) req_id exists, accepted, not cancelled, proof delivered and still within its five-minute queryable window, otherwise 410 expired; (3) no earlier removal using that req_id, otherwise 403 unauthorized detail removal already used; (4) fewer than three successful removals for that address in the preceding hour, otherwise 429 limit detail rate with the real Retry-After; (5) the chosen key is current for exactly the request's uid and is not the applicant key, otherwise 404 not_found; (6) current entries other than the applicant are at least the node's configured cap, otherwise 403 unauthorized detail not at the device limit. Invalid requests do not consume removal authorization or a successful-removal budget. For this route the window includes delivered+300 seconds; only elapsed greater than 300 seconds is expired, as selected by the lead.
+
+In one transaction, the accepting verifier builds and signs the ordinary revoke of §8.5 (the domain key on a domain node), applies the same revocation validation/mutation path as DELETE, retains the old-proof tombstone, records the successful rate debit and marks the request's one removal used. After commit it closes the removed device's sessions and emits record_changed. Success is 200 `{ "revoked": "<chosen key>", "revoke": <signed revoke> }`. The applicant retries the same signed PUT; no second removal is automatically attempted. A device cap response remains 429 limit with detail "<n> devices" and no Retry-After.
+
+This route does not protect legacy accounts against mailbox compromise and is disabled when approval admission (Annex E) is enforced. Strict replacement instead binds the chosen revocation and new-device endorsement to one current-device approval and commits removal/admission atomically; the defined no-device recovery may carry that chosen removal. A legacy bearer request is never substituted for that authorization.
 
 ### 9.3 Device session (WebSocket)
 
@@ -667,6 +676,8 @@ All messages are JSON objects with `t` (type). Requests carry `id` (a string cho
 - `stun` lists STUN servers, at least the node's own. `relay` lists TURN servers the device may use, with credentials that SHOULD expire after 1 hour; the device MAY authenticate again to obtain new ones. Both lists MAY include other nodes that announce `roles.relay`. In the `webrtc` profile they are passed to the WebRTC stack as its ICE servers.
 - After `ok`, the node MUST go through the watches whose target is this `uid` (§12) and update the `homes` entry if the device requests it.
 
+**Security version 1.** A node and a device that implement Annex E extend this exchange: the challenge also carries a session identifier and the node's security parameters, the device proves its server-assigned rolling token in `auth`, `ok` stays provisional until the device acknowledges the next token with a signed `token_ack` and the node answers `token_ok`, and every message with an effect carries `auth`, a signature over a single-use value the node issued. In transition mode a node still accepts the exchange above from devices that never upgraded.
+
 **Messages from device to node.**
 
 | Message | Response | Function |
@@ -686,6 +697,7 @@ All messages are JSON objects with `t` (type). Requests carry `id` (a string cho
 | `{ "t": "deliver", "env": {…} }` | Signaling envelope received |
 | `{ "t": "online", "uid": "…" }` | A `uid` this device was waiting for is online |
 | `{ "t": "record_changed", "uid": "…" }` | The record of a subscribed `uid` changed; resolve again |
+| `{ "t": "security", "kind": "…" }` | Content-free security notice (Annex E): `admission_pending`, `replacement_pending`, `device_stale`, `recovery_pending`. It prompts an authenticated fetch and authorizes nothing |
 
 Semantics of `connect`:
 
@@ -693,6 +705,7 @@ Semantics of `connect`:
 - `offline`: no device of the target has a session or a registered push. The envelope is discarded.
 - `unknown`: the `uid` does not exist or has blocked the origin. They are indistinguishable by design.
 - `unavailable`: the target's node could not be reached or did not answer in time (§9.4). Nothing was delivered; the client keeps the content and retries later. It is not `offline`: a `watch` would not reach that node either.
+- `limit`: the device exceeded the node's budget for `connect` (§15). Nothing was delivered; the client waits and retries. It is an ordinary answer: the node does not close the session for it.
 - A node MUST validate that `env.from.uid` and `env.from.dev` match the sending session and that `env.from.domain` is the domain that session authenticated with; otherwise `error invalid`.
 
 ### 9.4 Between nodes
@@ -1075,6 +1088,7 @@ A `429` for a rate MUST carry the `Retry-After` header (RFC 9110 §10.2.3) with 
 | Relay per session | operator's quota; recommended 1 Mbit/s and 10 minutes |
 | WebSocket session ping | 30 s; the node closes after 90 s without traffic |
 | Session: frame / subscriptions / sessions per device | 64 KiB / 256 / node's choice (the 7ks nodes: 4) |
+| `connect` per device | node's choice (the 7ks nodes: a bucket of 300 refilled at 5 per second); beyond it `limit` (§9.3) |
 | Shard table: `exp` | 7 days |
 | Direct `endpoints` attempt | 3 s |
 | ICE probes: interval / total | 50–200 ms / 30 s |
@@ -1294,7 +1308,123 @@ What an implementation MUST satisfy, per role, to call itself 7KSP/1. Each item 
 
 ---
 
+## Annex E. Version-1 device admission and rolling session credentials
+
+This annex defines security version 1. It supplements §§8–9 and overrides their older admission/authentication rules only as stated below. There is no account password in the normal flow. A device private key never leaves that device. Nodes retain directory, credential and admission metadata, never application content. Implementations MUST implement the entire version 1 state machine before claiming it; accepting only its field syntax is insufficient.
+
+**E01 — Bytes and notation.** J(X) is UTF-8 JCS under §2.2, H(X) is canonical unpadded base64url SHA256(X). All MACs are full HMAC-SHA256 under RFC 2104. U and D are canonical 32-byte uid/dev_pk encodings; DH is the new device's canonical 32-byte X25519 public key. N and C are 32-byte random nonces; S and O are 16-byte random session/operation identifiers. T is a 32-byte CSPRNG token. Signatures are ordinary RFC 8032 Ed25519, not Ed25519ph. G is a nonnegative safe integer generation. node is the configured canonical HTTPS origin without a trailing slash; host is the validated lowercase session authority, including a nondefault port. Unknown fields remain in signed original documents; a projection below signs exactly its listed fields.
+
+**E02 — One authority and one strict lease.** One serialized authoritative writer MUST own a uid's credentials, admission epochs and session lease. Independently rotating replicas or independently restored writers are forbidden. If that writer is unavailable, nodes MUST fail closed, not classify the error as a stale token. A version 1 device has at most one provisional-or-ready session. Successful authentication fences every older session and pool before ok; every effect and queued write MUST recheck that fence. Socket shutdown alone is not authorization. Replicas may serve public reads; election/promotion requires a separately specified fenced consistency protocol.
+
+**E03 — Transition.** A node may run transition or required mode. Transition accepts token-less authentication and unsigned commands only for never-upgraded legacy devices, still bounded by four sessions. Persisted version 1/strict state MUST NOT be removed by missing fields, ordinary renewal, restart or an old client. Required mode rejects legacy authentication. This switch MUST NOT bypass new-device admission or the current-device cap. Clients with stored credentials MUST NOT silently downgrade. A current legacy device with no credential history may first opt in during transition using fresh email possession, applicant signature and a signed self-endorsement on its READY legacy session; this exception never resets a strict, stale, revoked or expired incarnation.
+
+GET /7ks/v1/verify/challenge adds security:{v:1,admission:"legacy"|"approval",credentials:"transition"|"required"}; AP10 hash bytes remain unchanged. A version 1 client refuses missing/unsupported advertisement. Admission policy is independent of credential transition. The legacy req_id removal route is disabled when approval is enforced; it never substitutes for E19.
+
+**E04 — Enrollment start.** A version 1 POST /verify adds security:{v:1} and applicant_sig to the existing PoW/number-match request. The applicant signs J of this exact projection, with uid derived from the email, default empty name and lang exactly en or es:
+
+```text
+{type:"enroll",v:1,node,uid,dev_pk,dev_dh,nonce,name,lang}
+```
+
+nonce is the issued PoW nonce. All ordinary validation, PoW, honeypot and independently counted mail/source budgets remain. The retired recovery field is rejected; a recovery code is submitted only after mailbox approval through E15, never in this request or a URL. The 202 body adds a public non-authorizing operation O to req_id and code. Pending polls remain 202 with an empty body. Mail confirmation records mailbox possession; it MUST NOT issue a portable publication or revocation proof before admission authorization.
+
+**E05 — Admission state and intent.** Persist NEVER versus KNOWN account state independently of current entries, expiry and tombstones. Empty membership is not first-ever enrollment. Old entries/tombstones migrate to KNOWN; ambiguous empty legacy state fails closed. Only trusted local initialization may enable clean first-account bootstrap. At mailbox confirmation, create this immutable intent, where exp=iat+900 and proof is the exact unsigned domainsig with iat and exp=iat+2592000:
+
+```text
+{type:"admission",v:1,node,uid,domain,dev_pk,dev_dh,operation,epoch,nonce,code,name,iat,exp,proof}
+```
+
+The intent nonce and operation are independent 16-byte random values. code is the existing 3-digit number, not an authorization secret. At most four confirmed pending operations per uid and one per applicant per 120 seconds are allowed; ordinary issuance/source limits also apply.
+
+**E06 — Existing-device approval.** If a current own device exists, a different device needs that device's fresh local approval and original signed endorsement. A READY current own-device session may fetch admission_get{id,operation} without a pool signature; it returns admission{id,intent} for that uid only. A security admission_pending hint may prompt this bounded fetch but never approves it. The approving client compares the number and exact new keys/name, then signs this dedicated admission object only after a fresh local action:
+
+```text
+{type:"admit",v:1,node,uid,issuer,dev_pk,dev_dh,operation,epoch,nonce,proof_sha256,iat,exp,sig}
+```
+
+proof_sha256=H(J(intent.proof)); issuer is the current approver's dev_pk. exp MUST be future and no later than intent.exp; iat is within 120 seconds of the writer when approval is first accepted. Later use of the exact stored approval checks signed expiry/current authority, not a newly imposed iat-skew deadline. admit{id,endorsement,auth} is a pooled command. Imported history/grants and old contact display endorsements are not admission authority. The writer checks exact node/uid/new signing and DH keys/operation/epoch/nonce/proof binding, signature, unused authorization and current issuer both before proof issuance and atomically at publication. Backdating never authorizes a revoked issuer. Self-issuer is allowed only for renewal of that same current nonstale incarnation, with the retained DH tuple and READY credential authorization, or the narrow E03 first opt-in.
+
+**E07 — Proof and publication.** The signed domainsig adds admission:{v:1,operation,epoch,method,strict,endorsement?,choice?}; method is first, approval, renewal, recovery_code or recovery_wait, strict is 0 or 1. Its domain signature covers that extension. First admission can be consumed only while account remains NEVER; serialize competing first publications. Publication atomically rechecks admission, current issuer/epoch, seq and quota, consumes authorization, stores the entry, marks KNOWN and initializes any new strict credential. The first strict 200 response is {security:{v:1,generation:G},token:T}, where G is retained issued highwater+1, initially 1, no-store. A public replay, renewal or repeated PUT MUST NOT return/reset token material. A lost first response requires fresh authorized enrollment with new keys. Renewal preserves credentials. A stale incarnation cannot reset through a larger seq or routine fresh proof. A nonstale revoked/expired key may re-enroll only with a genuinely fresh authorized proof, past its revocation cut, and a fresh token at the retained generation highwater plus one. The eleventh current device is 429 limit with detail "10 devices", no Retry-After and no membership mutation; only current entries count.
+
+**E08 — Challenge and token proof.** A connection receives {t:"challenge",nonce:N,session:S,security:{v:1,node,required:B}}. Strict auth within 30 seconds is {t:"auth",uid,dev_pk,domain?,nonce:N,host,security:{v:1,generation:G,tok:M},sig}. TP, AP and M are exactly:
+
+```text
+TP = {type:"token",v:1,node,session,uid,dev_pk,nonce,host,generation}
+M = HMAC-SHA256(T,J(TP))
+AP = {type:"auth",v:1,node,session,uid,dev_pk,nonce,host,generation,tok:M}
+sig = Ed25519(dev_sk,J(AP))
+```
+
+The MAC is encoded canonical unpadded base64url. Domain is a routing hint, never an authority override. Verify bounds, exact challenge/session/node/host, signature and current membership before a token mismatch can affect credentials. Compare both current/pending candidate MACs in constant time, then atomically recheck membership/state at the writer. Invalid signature affects only this connection. A validly signed but nonmatching credential marks that incarnation stale, removes its secrets/lease, closes its sessions and emits only a device_stale hint to other current own devices. Reply unauthorized with detail token. A stale backup is not proof of theft; the server cannot identify the genuine copy.
+
+A validly signed stale mismatch also removes that exact directory entry atomically, preserving account-KNOWN/seq/generation history and invalidating pending admission authority. This local authoritative quarantine is not a fabricated device-signed revoke. It permits only the ordinary new-key approval or KNOWN-zero recovery path; it never resets the stale key.
+
+**E09 — Durable two-step replacement.** Retain current and at most one pending key/generation plus a never-decreasing issued-generation highwater. Matching current prepares a fresh pending/lease; matching pending first commits that exact pending as current, then prepares a fresh pending. Commit before provisional ok. It contains normal auth-ok fields plus security:{v:1,session:S,generation:P,pending:true}, token:Tnew and next:[32 fresh C values]. There MUST be no command, presence, watch/push or online effect before acknowledgement. Do not expire pending merely because its device stayed offline. An abandoned pending may be replaced by an authenticated current login; generations are never reused.
+
+**E10 — Client store and acknowledgement.** One exclusive owner holds the browser Web Lock for the entire session; tabs multiplex bounded requests through it. Native clients provide equivalent serialization. Before ACK, atomically and durably store node/uid/device/token/generation under a live-owner/session compare-and-set guard. A delayed retired-owner response cannot overwrite newer credentials. If storage fails, close without ACK. The exact acknowledgement is:
+
+```text
+AK = {type:"token_ack",v:1,node,session,uid,dev_pk,nonce,generation:P}
+proof = base64url(HMAC-SHA256(Tnew,J(AK)))
+ACK = {t:"token_ack",generation:P,proof,sig:Ed25519(dev_sk,J(AK plus proof))}
+```
+
+Both MAC and device signature are mandatory; the TLS terminator sees Tnew but cannot sign for the device. At the writer, recheck exact lease/pending generation/current membership, verify both proofs and commit pending to current/delete pending before token_ok{generation:P} and readiness. ACK deadline 30 seconds closes only that provisional lease, retaining recoverable keys. An exact duplicate ACK is idempotent only for the same active READY lease/generation. A retired ACK cannot commit newer state. Lost ok leaves current valid; stored-pending reconnect commits pending; lost ACK/token_ok after commit leaves the client's stored token matching current. No ordinary lost message alone is a stale-credential verdict.
+
+**E11 — Command transcript.** The effectful set is connect, watch, unwatch, subscribe, block, unblock, admit, admission_cancel, recovery_set, recovery_clear and replace_approve. Every strict command has auth:{v:1,nonce:C,sig}. Q is the entire original command with only top-level auth removed. The exact projection is:
+
+```text
+CP = {type:"cmd",v:1,node,host,session,uid,dev_pk,generation,nonce:C,sha256:H(J(Q))}
+sig = Ed25519(dev_sk,J(CP))
+```
+
+Do not reconstruct only known fields or strip nested signatures/auth. Ping, resolve, admission_get and replacement_get remain bounded read-only READY operations. No raw token belongs in a command signature. New operation types MUST be explicitly classified.
+
+**E12 — Effect ordering and permits.** Verify command bounds/signature/current membership, then atomically recheck exact READY lease/generation and claim an unused session nonce and unused request id, before any effect. Serialize this cut against login replacement and revocation. A failure sends unauthorized and closes only that session; it changes no device credential/other session and raises no copy warning. An exact retransmission is replay rejection with no second effect; lost responses require reconnect/reconcile. Normal authenticated business outcomes, including offline/unknown/quota errors, consume one permit and return exactly one fresh next string with id. Auth failures do not refill. The pool has at most 32 unused-plus-inflight permits; client queue at most 256. Retain at most 256 request ids,1–128 UTF 8 bytes each; at the bound reconnect rather than evicting replay barriers. Client response timeout 30 seconds closes/reconciles. The 64 KiB whole-frame bound includes auth; inner envelope limits remain unchanged. No exactly-once delivery across crash is promised.
+
+**E13 — Recovery cancelled by life.** The mailbox alone never admits a device while any device of the account is in use, where in use means it logs in at least once during the wait. This does not detect offline use, blocked network access or a malicious authority. One pending wait/account snapshots a durable successful-login serial. recovery_wait_days defaults 7; 0 refuses mailbox-only admission while any current entry remains. Every successful current-device login increments the serial and cancels that wait, including a wait-authorized but unpublished proof. Strict first ACK commit counts; provisional ok and duplicate ACK do not. Legacy successful authentication counts. Login must cancel even on the last second; final publication repeats the fence. Every READY socket has a monotonic maximum 1 hour, then reconnects with durable credentials without another email. An independent code authorization is not cancelled by login. Retain the operation through eligible+86400; at eligibility create a fresh finite intent/proof, not a seven-day bearer req_id. Same-operation start is idempotent; another start cannot reset its timer. Without authoritative durable state/single writer completion fails 503 unavailable.
+
+At recovery start and before eligibility, send EN/ES mail with one distinct 16-byte cancellation token each. Store only the two hashes; retry the same private MIME bytes rather than minting a third token. Ordinary verification mail carries no recovery cancellation. GET/HEAD /recovery/<token>/cancel is read-only; explicit POST action=cancel affects only its operation. A stale cancellation cannot cancel a newer operation. Signed admission_cancel also exists. Retain normalized email privately only until proof, cancellation or expiry, then remove it and associated pending spool; this is temporary §8.3 state, not a permanent address index. Notify own devices at their next login with security/recovery_pending and honest cancelled context. Delivery is not guaranteed.
+
+**E14 — Recovery query.** POST /7ks/v1/recovery/challenge with {uid,dev_pk,operation} returns {type:"recovery_challenge",v:1,node,uid,dev_pk,operation,epoch,nonce,exp}, nonce 32 bytes/120 seconds, one live per operation, at most 30/source/minute and one/operation/second. POST /recovery/query supplies {uid,dev_pk,operation,epoch,nonce,sig}, signing J of exactly:
+
+```text
+{type:"recovery_query",v:1,node,uid,dev_pk,operation,epoch,nonce}
+```
+
+Check exact applicant/operation/epoch/mail possession and signature before atomically consuming the fresh nonce. Waiting returns 202 {status:"waiting",eligible}; eligible returns 200 {proof} only after all admission checks. Replay/wrong authority is 403 unauthorized detail recovery; cancelled/expired is 410. No private email/token/code is returned by an unsigned query. Source/global limits still apply.
+
+**E15 — Independent recovery code.** The client generates 30 unbiased CSPRNG decimal digits, preserving leading zeros, and displays six groups of five (about 100 bits). It sends recovery_set{id,verifier:PHC,auth} only over a strict READY signed pooled command; the node stores only the canonical PHC and returns ordinary ok, never generates/returns digits. The fixed profile is Argon2id version 19, t = 3, m = 65536 KiB, p = 1, 16-byte salt, 32-byte output: `$argon2id$v=19$m=65536,t=3,p=1$<salt-base64-no-padding>$<tag-base64-no-padding>`. recovery_clear deletes it. Set/clear advance admission epoch. No HMAC-pepper or default parallelism substitution is allowed.
+
+After mailbox approval, POST /recovery/start uses {uid,dev_pk,operation,epoch,nonce,choice,sig}, signing J({type:"recovery_start",v:1,node,uid,dev_pk,operation,epoch,nonce,choice}). choice is explicit null below the cap or the exact selected same-uid current incarnation {dev_pk,dev_dh,proof_sha256:H(J(target.proof))}, distinct from applicant. POST /recovery/code uses {uid,dev_pk,operation,epoch,nonce,code,choice,sig}, signing J({type:"recovery_code",v:1,node,uid,dev_pk,operation,epoch,nonce,code_sha256:H(UTF 8(code)),choice}). code is exactly 30 ASCII digits. Missing choice is 400, not null. Code plus confirmed email may authorize immediately even with current devices. Malformed fields/profile/signature 400; wrong code 403, at most 5/uid/hour, changing no other wait. Claim the fresh nonce after signature verification, run Argon2 outside both locks under one nonqueued 64 MiB KDF slot (busy 429), then recheck exact verifier/epoch/state/choice and fresh time atomically. Correct code consumes that verifier and supersedes a different pending WAIT or wait-authorized-unpublished operation; old cancellation affects only old operation. No login/global epoch mutation may accidentally cancel the independent code authorization. No raw code in logs, URLs, evidence, archives or retained request state.
+
+RFC 9106 §§3–4 and the fixed Argon2id profile govern E15; the profile does not supply missing input entropy.
+
+**E16 — Lifecycle and errors.** Revocation/expiry invalidate sessions at once. Revocation deletes credential secrets/pending/lease but retains seq, generation/account history and tombstones. Stale state requires newly generated authorized keys. Ordinary nonstale revocation/expiry permits a fresh authorized incarnation as above, never an old token/proof replay. Malformed objects/signatures are 400 invalid; missing/changed endorsement or admission is 403 unauthorized with detail endorsement/admission; time-terminal operations 410 expired; bounded rate refusal 429 limit with a truthful Retry-After; device quota has none. Unavailable authority is not stale and not a client error. Current/epoch/quota and directory/admission/token changes MUST commit atomically. Callbacks and socket cleanup follow commit and cannot authorize already-fenced effects.
+
+**E17 — Honest scope.** At most one copy holds a strict lease; after committed rotation an independently stale copy is refused at its next login. Continuous secret-sharing copies cannot be distinguished, and a fail-stop stale warning cannot identify the genuine one. The server/TLS terminator sees issued token material; device-signed auth/ACK/commands protect action integrity, not confidentiality from that terminator or malicious authority. Compromised clients can sign, a compromised approving device can admit, and no signature proves a human tap or actual hardware persistence. Node deliver/online/record_changed/security messages remain hints except for their independently verified inner objects. They cannot grant trust, clear warnings or authorize wiping.
+
+**E18 — Storage and clocks.** Persist credential generations, pending state, account epochs, consumed admissions and recovery metadata before acknowledgements. Use a 0700 state directory and 0600 secret/database files; application erasure is not physical secure deletion. Clients keep tokens with local device keys and exclude both from archives/sync/export. Connection deadlines use monotonic time; durable recovery assumes trusted UTC. Refuse known untrusted/unavailable clock and a native start below the retained account wall-time lower bound before claiming its nonce. Host-clock tampering, forward jumps and independently restored state are not claimed detected; operator clock/storage trust remains required. Tests MUST cover lost-message/crash cuts, delayed ACK, concurrent logins/publications, revoked issuer, replay, rollback barriers, first/empty-known accounts, recovery/cancellation and legacy downgrade. Independent fixed JCS/Ed25519/HMAC fixtures supplement, not replace, real persistence tests.
+
+**E19 — Exact replacement and recovery publication.** A quota-refused applicant retains its exact signed C03 C. An approved current device O may authorize a selected target T, including O itself, only through a context-only replacement: ordinary DELETE MUST reject replace_revoke. X is {type:"replace_intent",v:1,node,uid,operation,proposal,epoch,nonce,dev_pk,dev_dh,entry_sha256,proof_sha256,target,iat,exp}; target is the exact incarnation tuple from E15. The immutable proposal/nonce are 16 random bytes, exp is no later than the original intent, original D.exp when present, and now+900 seconds; hashes are H(J(exact object)). DR0={type:"admit_replace",v:1,node,uid,issuer,dev_pk,dev_dh,operation,proposal,epoch,nonce,entry_sha256,proof_sha256,target,revocation_sha256,iat,exp}; R0={type:"replace_revoke",v:1,node,uid,by,dev_pk,dev_dh,new_dev_pk,new_dev_dh,operation,proposal,epoch,nonce,entry_sha256,proof_sha256,iat,exp}. DR0.revocation_sha256=H(J(R0)); DR=DR0 plus issuer signature, R=R0 plus same issuer signature, each over its own unsigned object. R.dev_pk/dev_dh name T and proof_sha256 its proof; R.new_dev_pk/new_dev_dh name N; both times/context agree. Resolve replacement_get{id,proposal} on a READY own lease, then pooled replace_approve{id,endorsement:DR,revoke:R,auth}. Both the original admission issuer and replacement issuer must be current at the atomic pre-state cut; O=T is allowed only here. No ordinary portable revoke is released before admission.
+
+POST /admission/challenge body {uid,dev_pk,operation,purpose}, purpose replace_prepare|replace_query|replace_submit, returns {v:1,node,uid,dev_pk,operation,purpose,nonce,exp}, nonce 32 bytes/120 seconds. Prepare path is exactly /7ks/v1/admission/replacement/prepare, body {entry:C,target,nonce,sig}, signed projection {type:"replace_prepare",v:1,node,operation,uid,dev_pk,nonce,entry_sha256:H(J(C)),target}; returns 200 {intent:X}. Query path /7ks/v1/admission/replacement/query has {uid,dev_pk,operation,proposal,nonce,sig}, projection {type:"replace_query",v:1,node,operation,proposal,uid,dev_pk,nonce}; pending 202 or 200 {intent:X,endorsement:DR,revoke:R}. Submit path /7ks/v1/admission/replacement/submit has {entry:C,endorsement:DR,revoke:R,nonce,sig}, projection {type:"replace_submission",v:1,node,operation,uid,dev_pk,nonce,entry_sha256:H(J(C)),endorsement_sha256:H(J(DR)),revocation_sha256:H(J(R))}. The final signature is the applicant's, never O's. A replacement_pending hint contains uid/proposal only and approves nothing.
+
+ALL first recovery publication, even below cap, uses this fresh applicant flow. target MUST equal the signed proof admission.choice; for recovery endorsement:null and revoke:null are mandatory; DR and R are explicit null fields, both hashes H(J(null)); absence fails 400. Recovery X is autoauthorized, needing no old device. Ordinary PUT of unconsumed recovery proof is 403; later ordinary higher-seq republication of the consumed current entry returns no token. One FULL transaction validates proof/operation/epoch/life fence/current issuers/exact target/nonce/seq/cap, consumes authorization, revokes the target if any, stores C and initializes credentials. Any failure rolls everything back. Only the final applicant's private 200 response receives its first token; loss requires fresh authorized new keys. Postcommit sessions close and record_changed emits. No silent retarget, code refund or remove-first gap.
+
+replacement_get returns {t:"replacement",id,intent:X,entry:C}, the exact stored original signed C03. O MUST independently validate its proof, signatures and H(J(C))=X.entry_sha256 before the fresh local add-and-remove action; a bare hash/name supplied by the node is insufficient. No signed projection changes.
+
+Prepare MUST bound UTF-8 JCS({intent:X,entry:C}) to 60000 bytes before storing X;60001 fails429 limit detail replacement size, no Retry-After. Canonical UTF-8 fetch plus bounded t/id remains within 64 KiB. Never truncate C or serve a hash-only fallback.
+
+For an already-consumed/current entry, routine higher-seq republication does not revalidate its historical admission issuer or old admission epoch; it retains ordinary membership, entry/proof expiry, signature and sequence checks, never returns/resets a token and never clears stale quarantine. The initial-publication cut still requires current issuers. DR/R iat skew applies at first approval acceptance only; stored approval is thereafter checked for expiry/currentness and exact context.
+
+References: RFC 2104 §2; RFC 8032 §§5.1.6–5.1.7; RFC 8785 §3.2; RFC 4648 §5; Web Locks and IndexedDB transaction durability. RFC 9449 supplies useful request-binding/replay analysis but this annex is not DPoP and claims no certification.
+
+---
+
 ## History
+
+- **0.8 (draft, unreleased)** — Device security version 1 (Annex E), from the lead's rolling-challenge design (draft 0.4 of the design note) and the API team's contract, audit and two independent implementations: a further device is admitted by the email link plus the approval of a device the account already has, or by recovery (a seven-day wait that any login of a current device cancels, or a recovery code); a server-assigned rolling token proven at every login, with one live session per device and two-step replacement, so a stale or restored copy is stopped; every message with an effect signed over a single-use value issued by the node; the eleventh device replaces a chosen one in one approved, atomic operation. Also: a device may revoke itself when it signs out (§8.5); the legacy route that frees one place at the device cap (§9.2); a `connect` budget per device and the `security` notices (§9.3, §15).
 
 - **0.7 (draft, unreleased)** — Security review of 2026-11-09: the lead's own audit, the audit of the API team and the review of the mobile team, against Noise rev. 34, RFC 8032, RFC 8439, RFC 4648, RFC 8785 with erratum 7920, RFC 5321 and libsodium. Correction: the sealed box pseudocode omitted the HSalsa20 key derivation of `crypto_box_seal` (§2.4). The `noise` profile made exact (§11.4): counters start at 0, the AEAD nonce is the Noise one (little-endian) while the counter on the wire is big-endian, empty associated data, the replay window to the position, and every `handshake_init` is a new message with a strictly greater timestamp. New rules: canonical base64url, `-0` rejected, RFC 8032 verification (§2.1, §2.2); verifier limits counted independently with a daily cap, links only from the node's own names, tokens hashed and never logged, bounces (§8.3); a revocation closes sessions and refuses the old proof (§8.5, §9.3); a node answers only under its own names, `421` otherwise (§9); the device cap answer and session bounds (§9.2, §9.3, §15); crossed offers (§10.5); the real `Retry-After` and no server error for a client error (§14); the proof-of-work preimage is UTF-8 bytes (§8.9); five paragraphs added to §16.
 
